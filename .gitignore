@@ -1,0 +1,14 @@
+build/
+*.sfc
+*.smc
+*.srm
+*.zip
+*.exe
+*.obj
+*.lib
+*.pdb
+*.ilk
+.vs/
+CMakeSettings.json
+out/
+*.log

@@ -31,10 +31,11 @@ We're just getting started. The project structure is in place, snesrecomp is lin
 | Milestone | Status | Functions | Notes |
 |-----------|--------|-----------|-------|
 | Project setup | DONE | — | CMake, snesrecomp submodule, cpu_ops.h |
-| ROM analysis | TODO | — | Map ROM header, find reset vector, identify banks |
-| Boot chain | TODO | 0 | Reset vector, hardware init, stack setup |
-| NMI handler | TODO | 0 | VBlank interrupt, DMA transfers, input reading |
-| Main loop | TODO | 0 | State machine, frame dispatch |
+| ROM analysis | DONE | — | LoROM, 1MB, reset=$8000, NMI=$819D, no SRAM |
+| Boot chain | DONE | 7 | Reset vector, PPU init, WRAM clear, DMA loaders, OAM init, RNG seed |
+| NMI handler | DONE | 4 | Reentrance guard, OAM DMA, VRAM ring buffer, indirect dispatch |
+| SPC700 comms | WIP | 1 | Port write handshake done, audio upload TODO |
+| Main loop | WIP | 3 | Entry point stubbed, asset loaders partially done |
 | Title screen | TODO | 0 | Logo, menu, "Press Start" |
 | World map | TODO | 0 | City selection, Luigi walking on map |
 | City exploration | TODO | 0 | Luigi walking, NPC interaction, sprite rendering |
@@ -42,20 +43,23 @@ We're just getting started. The project structure is in place, snesrecomp is lin
 | Audio engine | TODO | 0 | SPC700 music/SFX upload and playback |
 | Full playthrough | TODO | 0 | All cities, all artifacts, ending sequence |
 
-**Total recompiled functions: 0** (we're at the starting line!)
+**Total recompiled functions: 12** (plus mirrors = 24 registered addresses)
 
 ### What's Done
 - Project structure matching the snesrecomp ecosystem (CMake, includes, recomp layout)
 - Full 65816 CPU instruction helper library (`cpu_ops.h`) — every op you'd need to recompile
 - snesrecomp submodule linked — real PPU, real SPC700 audio, real DMA, all ready to go
-- Launcher (`main.c`) with the standard init → boot → frame loop → shutdown lifecycle
-- Stub boot chain ready for actual ROM disassembly
+- ROM analyzed: LoROM, 1MB, RESET at $8000, NMI at $819D, IRQ at $818A, no SRAM, no coprocessors
+- **Complete boot chain**: reset vector ($8000), PPU init ($8050), VRAM clear, CGRAM clear, OAM init ($842C), DMA table loaders ($8453/$8471/$8506), RNG seed ($8349)
+- **Full NMI handler**: reentrance guard, frame counter, OAM DMA ($85C0), VRAM/CGRAM ring buffer DMA, indirect vector dispatch ($81E1), INIDISP restore
+- **SPC700 command protocol**: handshake port write ($9203)
+- ROM analysis tool (`tools/rom_analyze.py`) with M/X flag-tracking disassembler
 
 ### What's Next
-1. **Disassemble the ROM** — read the reset vector from the LoROM header, trace the boot chain
-2. **Recompile the reset vector** — the first real function, setting up native mode and the stack
-3. **NMI handler** — get VBlank processing working so we can render frames
-4. **Title screen** — first visual output, the moment it stops being stubs
+1. **Recompile the transfer subroutine at $00:915A** — used by asset loaders to move ROM data
+2. **SPC700 audio engine upload** — get music playing via the IPL boot protocol
+3. **Main loop state machine at $9A5E** — the game's frame dispatcher
+4. **Title screen** — first visual output, the moment Luigi appears on screen
 
 ## Architecture
 

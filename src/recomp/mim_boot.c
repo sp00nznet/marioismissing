@@ -41,6 +41,7 @@ static void mim_028000(void);  /* Bank 2 game logic */
 static void mim_02865E(void);  /* New game init */
 static void mim_028101(void);  /* Gameplay PPU setup */
 static void mim_028A1C(void);  /* Frame wait with input */
+static void mim_01869B(void);  /* Per-frame attract mode update */
 
 /*
  * Register all recompiled functions in the function table.
@@ -967,6 +968,78 @@ static void mim_008BF5(void) {
                 y = 0;
             }
         }
+    } else if (comp_type == 2) {
+        /* Mode 1 (type byte 2): word-level decompression.
+         * Writes directly to WRAM $7F:0000+X (absolute long).
+         *
+         * Command byte: [MM CCCCCC] where MM=mode, C=count
+         *   $00: zero-fill count words
+         *   $40: copy count literal words from source
+         *   $80: inc/dec word fill (bit 5: 0=inc, 1=dec with 5-bit count)
+         *   $C0: constant word fill
+         *   $00 command = end of stream
+         */
+        uint8_t *wram = bus_get_wram();
+        if (!wram) return;
+
+        /* X = WRAM write offset (set by caller in $60, loaded at entry) */
+        uint32_t write_off = wram_offset;  /* from g_cpu.X */
+        uint16_t y = 1;  /* skip type byte */
+
+        while (1) {
+            uint8_t cmd = bus_read8(src_bank, src_lo + y);
+            if (cmd == 0) break;
+            y++;
+
+            uint8_t count = cmd & 0x3F;
+            uint8_t mode = cmd & 0xC0;
+
+            if (mode == 0x00) {
+                /* Zero-fill count words */
+                for (int i = 0; i < count; i++) {
+                    wram[0x10000 + write_off] = 0;
+                    wram[0x10000 + write_off + 1] = 0;
+                    write_off += 2;
+                }
+            } else if (mode == 0x40) {
+                /* Copy count literal words */
+                for (int i = 0; i < count; i++) {
+                    uint8_t lo = bus_read8(src_bank, src_lo + y);
+                    uint8_t hi = bus_read8(src_bank, src_lo + y + 1);
+                    y += 2;
+                    wram[0x10000 + write_off] = lo;
+                    wram[0x10000 + write_off + 1] = hi;
+                    write_off += 2;
+                }
+            } else if (mode == 0x80) {
+                /* Inc/dec word fill */
+                uint8_t real_count = count;
+                int decrement = 0;
+                if (count & 0x20) {
+                    real_count = count & 0x1F;
+                    decrement = 1;
+                }
+                uint16_t val = bus_read8(src_bank, src_lo + y) |
+                              (bus_read8(src_bank, src_lo + y + 1) << 8);
+                y += 2;
+                for (int i = 0; i < real_count; i++) {
+                    wram[0x10000 + write_off] = (uint8_t)(val & 0xFF);
+                    wram[0x10000 + write_off + 1] = (uint8_t)(val >> 8);
+                    write_off += 2;
+                    if (decrement) val--; else val++;
+                }
+            } else {
+                /* $C0: constant word fill */
+                uint16_t val = bus_read8(src_bank, src_lo + y) |
+                              (bus_read8(src_bank, src_lo + y + 1) << 8);
+                y += 2;
+                for (int i = 0; i < count; i++) {
+                    wram[0x10000 + write_off] = (uint8_t)(val & 0xFF);
+                    wram[0x10000 + write_off + 1] = (uint8_t)(val >> 8);
+                    write_off += 2;
+                }
+            }
+        }
     } else if (comp_type == 3) {
         /* LZ bitstream decompression (mode 3) */
         /* Mode 2 (type byte 3): LZ bitstream with 12-bit ring buffer.
@@ -1265,7 +1338,10 @@ static void mim_008F27(void) {
 }
 
 /*
- * $00:87DF — Decompress ROM data to VRAM (alt staging at $7F:F800)
+ * $00:87DF — Decompress ROM data to VRAM (via $7F:8000 staging)
+ *
+ * Like $8781 but reads an additional method word from the source.
+ * Decompresses to WRAM $7F:8000, then DMAs to VRAM.
  */
 static void mim_0087DF(void) {
     op_rep(0x20);
@@ -1277,27 +1353,65 @@ static void mim_0087DF(void) {
     uint16_t src_lo = bus_wram_read16(g_cpu.DP + 0x5D);
     uint8_t src_bank = bus_wram_read8(g_cpu.DP + 0x5F);
 
+    /* Read size from [$5D] */
     uint16_t data_size = bus_read16(src_bank, src_lo);
     bus_wram_write16(g_cpu.DP + 0x2C, data_size);
 
+    /* DMA source = $7F:8000 (same staging as $8781) */
     bus_wram_write8(g_cpu.DP + 0x2E, 0x00);
-    bus_wram_write16(g_cpu.DP + 0x2F, 0xF800);
+    bus_wram_write16(g_cpu.DP + 0x2F, 0x8000);
     bus_wram_write8(g_cpu.DP + 0x31, 0x7F);
 
-    src_lo += 2;
+    /* Skip size (2 bytes) + method word (2 bytes) */
+    src_lo += 4;
     bus_wram_write16(g_cpu.DP + 0x5D, src_lo);
 
-    /* Read and skip transfer method word */
-    src_lo += 2;
-    bus_wram_write16(g_cpu.DP + 0x5D, src_lo);
+    /* Decompress to WRAM $7F:8000 */
+    mim_008BB7();
 
-    /* Decompress to WRAM $7F:F800 */
-    bus_write8(0x00, 0x2181, 0x00);
-    bus_write8(0x00, 0x2182, 0xF8);
-    bus_write8(0x00, 0x2183, 0x01);
-    g_cpu.X = 0xF800;
-    CPU_SET_A8(0x01);
-    mim_008BF5();
+    /* Post-process: convert packed 4bpp pixels to SNES interleaved bitplane format.
+     * The decompressed data at $7F:8000 is in packed format (2 pixels per byte,
+     * high nibble first). SNES PPU expects interleaved bitplanes.
+     *
+     * Input (per 8x8 tile, 32 bytes):
+     *   4 bytes per row × 8 rows = 32 bytes, each byte = 2 pixels (4bpp)
+     *
+     * Output (per 8x8 tile, 32 bytes):
+     *   Bytes  0-15: BP0/BP1 interleaved (BP0_row0, BP1_row0, ...)
+     *   Bytes 16-31: BP2/BP3 interleaved (BP2_row0, BP3_row0, ...) */
+    {
+        uint8_t *wram = bus_get_wram();
+        if (wram && data_size > 0) {
+            uint8_t *src_data = wram + 0x18000;  /* $7F:8000 */
+            /* Convert in a temp buffer to avoid in-place conflicts */
+            uint8_t tile_buf[32];
+            int num_tiles = data_size / 32;
+
+            for (int t = 0; t < num_tiles; t++) {
+                uint8_t *tile_in = src_data + t * 32;
+                memset(tile_buf, 0, 32);
+
+                for (int row = 0; row < 8; row++) {
+                    for (int col = 0; col < 8; col++) {
+                        /* Read pixel from packed format */
+                        int byte_idx = row * 4 + col / 2;
+                        uint8_t packed = tile_in[byte_idx];
+                        uint8_t pixel = (col & 1) ? (packed & 0x0F) : (packed >> 4);
+
+                        uint8_t bit_mask = 0x80 >> col;
+
+                        /* Distribute pixel bits to bitplanes */
+                        if (pixel & 1) tile_buf[row * 2 + 0] |= bit_mask;   /* BP0 */
+                        if (pixel & 2) tile_buf[row * 2 + 1] |= bit_mask;   /* BP1 */
+                        if (pixel & 4) tile_buf[16 + row * 2 + 0] |= bit_mask; /* BP2 */
+                        if (pixel & 8) tile_buf[16 + row * 2 + 1] |= bit_mask; /* BP3 */
+                    }
+                }
+
+                memcpy(tile_in, tile_buf, 32);
+            }
+        }
+    }
 
     /* DMA to VRAM */
     op_rep(0x20);
@@ -1842,6 +1956,13 @@ static void mim_018320(void) {
         CPU_SET_A8(0x84);
         mim_008E9D();
 
+        /* Reload BG1/2 tile patterns (cleared by $02:8000) */
+        op_rep(0x20);
+        bus_wram_write16(g_cpu.DP + 0x5D, 0x8DDB);
+        bus_wram_write16(g_cpu.DP + 0x5F, 0x0082);
+        g_cpu.C = 0x2000;
+        mim_0087DF();
+
         /* Load shared game graphics + tilemap */
         op_rep(0x20);
         g_cpu.C = 0x0000;
@@ -1862,16 +1983,20 @@ static void mim_018320(void) {
         bus_write8(0x00, 0x4306, 0x08);
         bus_write8(0x00, 0x420B, 0x01);  /* trigger DMA ch0 */
 
-        /* Show BG3 (text) + OBJ. BG1/2 tilemaps not yet populated. */
-        bus_write8(0x00, 0x212C, 0x14);  /* BG3 + OBJ */
+        /* Load initial background via $869B before fade-in */
+        mim_01869B();
+
+        /* Enable BG1 (background) + BG3 (text) + OBJ */
+        bus_write8(0x00, 0x212C, 0x15);  /* BG1 + BG3 + OBJ */
 
         /* Screen fade-in */
         mim_00828C();
 
-        /* Menu display loop — wait for Start/A button or timeout */
+        /* Menu display loop — call $869B per frame for background updates */
         op_rep(0x30);
         for (uint16_t x = 0; x < 0x04B0; x++) {
-            mim_008249();
+            if (x == 3) snesrecomp_dump_ppu("mim_menu_debug.txt");
+            mim_01869B();
             /* Check for Start ($10) or A ($80) button */
             uint8_t joy = bus_wram_read8(0x0038);
             if (joy & 0x90) break;
@@ -1932,14 +2057,17 @@ static void mim_028101(void) {
 
     op_rep(0x30);
 
-    /* Clear CGRAM and VRAM */
+    /* Clear CGRAM and VRAM (original does this unconditionally) */
     mim_00817B();  /* CGRAM clear */
     mim_00818E();  /* VRAM clear */
+
+    /* Load initial graphics back after clear */
+    /* Call JSR $898E equivalent — this reloads tile data */
 
     /* Check $1215 for game state */
     uint16_t state_1215 = bus_wram_read16(0x1215);
     if (!(state_1215 & 0x8000)) {
-        /* New game: additional init */
+        /* New game: call $82:8A0A (init graphics) then $8453 */
         mim_008453();
     }
 
@@ -1958,6 +2086,55 @@ static void mim_028101(void) {
 static void mim_028A1C(void) {
     /* Simplified: just wait one frame via $8249 */
     mim_008249();
+}
+
+/*
+ * $01:869B — Per-frame attract mode update
+ *
+ * Loads shared graphics via $D3D2 and a background tilemap
+ * to VRAM $0000 (BG1 tilemap) based on game state $05ED.
+ */
+static void mim_01869B(void) {
+    /* Wait frame */
+    mim_028A1C();
+
+    /* Load shared graphics with current state */
+    op_rep(0x30);
+    g_cpu.C = bus_wram_read16(0x05ED);
+    mim_00D3D2();
+
+    /* Load background tilemap to VRAM $0000 based on state */
+    uint16_t state = bus_wram_read16(0x05ED);
+    op_rep(0x20);
+
+    if (state == 0) {
+        bus_wram_write16(g_cpu.DP + 0x5D, 0xFE2F);
+        bus_wram_write16(g_cpu.DP + 0x5F, 0x0089);
+    } else if (state == 0xFFFF) {
+        bus_wram_write16(g_cpu.DP + 0x5D, 0xFDEC);
+        bus_wram_write16(g_cpu.DP + 0x5F, 0x0084);
+    } else {
+        bus_wram_write16(g_cpu.DP + 0x5D, 0xFED9);
+        bus_wram_write16(g_cpu.DP + 0x5F, 0x0089);
+    }
+    g_cpu.C = 0x0000;  /* VRAM dest = $0000 */
+    mim_008781();
+
+    /* Transfer BG3 tilemap buffer to VRAM $0800 */
+    bus_write8(0x00, 0x2115, 0x80);
+    bus_write8(0x00, 0x2116, 0x00);
+    bus_write8(0x00, 0x2117, 0x08);
+    bus_write8(0x00, 0x4300, 0x01);
+    bus_write8(0x00, 0x4301, 0x18);
+    bus_write8(0x00, 0x4302, 0x00);
+    bus_write8(0x00, 0x4303, 0xF0);
+    bus_write8(0x00, 0x4304, 0x7F);
+    bus_write8(0x00, 0x4305, 0x00);
+    bus_write8(0x00, 0x4306, 0x08);
+    bus_write8(0x00, 0x420B, 0x01);
+
+    /* Wait frame */
+    mim_028A1C();
 }
 
 static void mim_028000(void) {

@@ -1853,25 +1853,19 @@ static void mim_018320(void) {
         bus_write8(0x00, 0x4306, 0x08);
         bus_write8(0x00, 0x420B, 0x01);  /* trigger DMA ch0 */
 
-        /* Only show BG3 (text layer) until BG1/2 tilemaps are properly loaded */
-        bus_write8(0x00, 0x212C, 0x14);  /* BG3 + OBJ only */
+        /* Show BG3 (text) + OBJ. BG1/2 tilemaps not yet populated. */
+        bus_write8(0x00, 0x212C, 0x14);  /* BG3 + OBJ */
 
         /* Screen fade-in */
         mim_00828C();
 
-        /* Original has a 1200-frame display loop here. */
+        /* Menu display loop — wait for Start/A button or timeout */
         op_rep(0x30);
         for (uint16_t x = 0; x < 0x04B0; x++) {
             mim_008249();
-            if (x == 5) {
-                uint8_t wram01 = bus_wram_read8(0x0001);
-                uint8_t wram00 = bus_wram_read8(0x0000);
-                uint8_t wram02 = bus_wram_read8(0x0002);
-                printf("mim: frame 5: WRAM $00=%02X $01=%02X $02=%02X\n", wram00, wram01, wram02);
-                snesrecomp_dump_ppu("mim_attract_debug.txt");
-            }
-            uint8_t joy = bus_wram_read8(g_cpu.DP + 0x38);
-            if (joy & 0x10) break;
+            /* Check for Start ($10) or A ($80) button */
+            uint8_t joy = bus_wram_read8(0x0038);
+            if (joy & 0x90) break;
         }
     }
 

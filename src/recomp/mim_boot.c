@@ -38,6 +38,9 @@ static void mim_00D24B(void);  /* Title screen */
 static void mim_00D4A3(void);  /* Game state machine */
 static void mim_018320(void);  /* State setup */
 static void mim_028000(void);  /* Bank 2 game logic */
+static void mim_02865E(void);  /* New game init */
+static void mim_028101(void);  /* Gameplay PPU setup */
+static void mim_028A1C(void);  /* Frame wait with input */
 
 /*
  * Register all recompiled functions in the function table.
@@ -87,6 +90,12 @@ void mim_register_all(void) {
     func_table_register(0x818320, (snes_func_t)mim_018320);
     func_table_register(0x028000, (snes_func_t)mim_028000);
     func_table_register(0x828000, (snes_func_t)mim_028000);
+    func_table_register(0x02865E, (snes_func_t)mim_02865E);
+    func_table_register(0x82865E, (snes_func_t)mim_02865E);
+    func_table_register(0x028101, (snes_func_t)mim_028101);
+    func_table_register(0x828101, (snes_func_t)mim_028101);
+    func_table_register(0x028A1C, (snes_func_t)mim_028A1C);
+    func_table_register(0x828A1C, (snes_func_t)mim_028A1C);
     func_table_register(0x008BF5, (snes_func_t)mim_008BF5);
     func_table_register(0x808BF5, (snes_func_t)mim_008BF5);
     func_table_register(0x008BB7, (snes_func_t)mim_008BB7);
@@ -1882,22 +1891,120 @@ static void mim_018320(void) {
  * Handles game logic flow, sets up function pointers for
  * the main game state machine.
  */
+/*
+ * $02:865E — New game initialization
+ *
+ * Force blank, wait one frame, disable NMI.
+ */
+static void mim_02865E(void) {
+    op_sep(0x30);
+    bus_wram_write8(0x0001, 0x80);  /* force blank */
+    mim_008249();
+    bus_write8(0x00, 0x4200, 0x00);  /* disable NMI */
+    bus_wram_write8(0x0000, 0x00);
+}
+
+/*
+ * $02:8101 — Gameplay PPU setup
+ *
+ * Sets up Mode 9 display, clears VRAM and CGRAM,
+ * configures OBJ and BG settings for gameplay.
+ */
+static void mim_028101(void) {
+    uint8_t saved_db = g_cpu.DB;
+    g_cpu.DB = 0x02;
+
+    op_sep(0x30);
+
+    /* Enable FastROM */
+    bus_write8(0x00, 0x420D, 0x01);
+
+    /* OBJ settings: size=8/16, name base=$02 */
+    bus_write8(0x00, 0x2101, 0x02);
+
+    /* BG tile base: all at 0 */
+    bus_write8(0x00, 0x210B, 0x00);
+    bus_write8(0x00, 0x210C, 0x00);
+
+    /* Mode 9 (Mode 1 + BG3 priority), all layers on main screen */
+    bus_write8(0x00, 0x2105, 0x09);
+    bus_write8(0x00, 0x212C, 0x17);
+
+    op_rep(0x30);
+
+    /* Clear CGRAM and VRAM */
+    mim_00817B();  /* CGRAM clear */
+    mim_00818E();  /* VRAM clear */
+
+    /* Check $1215 for game state */
+    uint16_t state_1215 = bus_wram_read16(0x1215);
+    if (!(state_1215 & 0x8000)) {
+        /* New game: additional init */
+        mim_008453();
+    }
+
+    /* Wait one frame */
+    mim_008249();
+
+    g_cpu.DB = saved_db;
+}
+
+/*
+ * $02:8A1C — Frame wait with input check
+ *
+ * Waits for the next frame (polls $04 for change).
+ * If $12A5 is not $FFFF, also checks Start button to break out.
+ */
+static void mim_028A1C(void) {
+    /* Simplified: just wait one frame via $8249 */
+    mim_008249();
+}
+
 static void mim_028000(void) {
-    printf("mim: STUB $02:8000 (game logic dispatcher)\n");
+    printf("mim: $02:8000 game logic dispatcher\n");
+
+    uint8_t saved_db = g_cpu.DB;
+    g_cpu.DB = 0x02;
     op_rep(0x30);
 
     /* Save stack pointer */
     bus_wram_write16(0x12A5, g_cpu.S);
 
-    /* Check $058D for game state */
-    uint16_t state = bus_wram_read16(0x058D);
-    if (state != 0) {
+    /* Clear continue flag */
+    bus_wram_write16(0x1215, 0x0000);
+
+    /* Check $058D: if nonzero, set continue flag */
+    uint16_t state_058D = bus_wram_read16(0x058D);
+    if (state_058D != 0) {
         bus_wram_write16(0x1215, 0xFFFF);
     } else {
-        bus_wram_write16(0x1215, 0x0000);
+        /* New game init */
+        mim_02865E();
     }
 
-    /* Clear carry (success) */
+    /* PPU setup for gameplay */
+    mim_028101();
+
+    /* Set up game state function pointers */
+    bus_wram_write16(0x00F3, 0xE2BC);  /* state table 1 */
+    bus_wram_write16(0x00F5, 0x0082);  /* bank $82 */
+    bus_wram_write16(0x00F7, 0xC723);  /* state table 2 */
+    bus_wram_write16(0x00F9, 0x0082);  /* bank $82 */
+
+    /* The real $82:8152 runs the game state machine here.
+     * For now, run a simplified version: process a few frames
+     * of the game state with sprite animation. */
+    op_rep(0x30);
+    bus_wram_write16(0x1217, 0x0000);
+    bus_wram_write16(0x1219, 0x0000);
+    bus_wram_write16(0x0E9F, 0x0000);
+
+    /* Run some frames so sprites/tiles can load */
+    for (int i = 0; i < 60; i++) {
+        mim_028A1C();
+    }
+
+    g_cpu.DB = saved_db;
     g_cpu.flag_C = 0;
 }
 

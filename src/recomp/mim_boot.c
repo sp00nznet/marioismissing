@@ -1906,11 +1906,101 @@ static void mim_00D8A1(void) {
     /* Enable all layers */
     bus_write8(0x00, 0x212C, 0x17);
 
-    /* Load palettes via $8E9D */
+    /* Load sprite palette from $84:B5FB via $8EE4 (similar to $8E9D) */
     op_sep(0x20);
+    g_cpu.Y = 0x0000;
     g_cpu.X = 0xB5FB;
     CPU_SET_A8(0x84);
     mim_008E9D();
+
+    /* Load BG tiles from $84:8000 to VRAM $3000 */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0x8000);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0084);
+    g_cpu.C = 0x3000;
+    mim_008781();
+
+    /* Load tilemap from $84:BC75 to VRAM $28C0 */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0xBC75);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0084);
+    g_cpu.C = 0x28C0;
+    mim_008781();
+
+    /* Load tilemap from $84:BE20 to VRAM $2CC0 */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0xBE20);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0084);
+    g_cpu.C = 0x2CC0;
+    mim_008781();
+
+    /* Load BG3 tiles from $84:B98C to VRAM $6000 */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0xB98C);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0084);
+    g_cpu.C = 0x6000;
+    mim_008781();
+
+    /* Load tilemap from $84:BBA3 to VRAM $18C0 */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0xBBA3);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0084);
+    g_cpu.C = 0x18C0;
+    mim_008781();
+
+    /* Load tilemap from $84:BC0C to VRAM $1CC0 */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0xBC0C);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0084);
+    g_cpu.C = 0x1CC0;
+    mim_008781();
+
+    /* Load more palettes from $81:E83F and $85:FF0D */
+    op_sep(0x20);
+    g_cpu.Y = 0x0080;
+    g_cpu.X = 0xE83F;
+    CPU_SET_A8(0x81);
+    mim_008E9D();
+
+    g_cpu.Y = 0x00F0;
+    g_cpu.X = 0xFF0D;
+    CPU_SET_A8(0x85);
+    mim_008E9D();
+
+    /* Load tilemap from $84:B6FC to VRAM $1000 */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0xB6FC);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0084);
+    g_cpu.C = 0x1000;
+    mim_008781();
+
+    /* Load tilemap from $85:F5BA to VRAM $0000 */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0xF5BA);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0085);
+    g_cpu.C = 0x0000;
+    mim_008781();
+
+    /* Load tilemap from $81:B765 to VRAM $0800 */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0xB765);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0081);
+    g_cpu.C = 0x0800;
+    mim_008781();
+
+    /* Load tilemap from $81:BD1D to VRAM $0C00 */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0xBD1D);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0081);
+    g_cpu.C = 0x0C00;
+    mim_008781();
+
+    /* Load tilemap from $81:C375 to VRAM $1200 */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0xC375);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0081);
+    g_cpu.C = 0x1200;
+    mim_008781();
 }
 
 static void mim_00D4A3(void) {
@@ -1965,6 +2055,7 @@ static void mim_00D4A3(void) {
 
     /* Gameplay display loop — show whatever is rendered */
     printf("mim: entering gameplay loop\n"); fflush(stdout);
+    snesrecomp_dump_ppu("mim_gameplay_debug.txt");
     bus_wram_write16(0x067F, 0x0000);
     for (int frame = 0; frame < 1800; frame++) {
         mim_008249();

@@ -25,9 +25,13 @@ static void mim_00915A(uint16_t src_addr, uint8_t src_bank);  /* SPC700 IPL uplo
 static void mim_008BF5(void);  /* WRAM compressed data load */
 static void mim_008BB7(void);  /* Decompress to WRAM $7F:8000 */
 static void mim_008781(void);  /* Decompress + DMA to VRAM */
+static void mim_0087DF(void);  /* Decompress + DMA to VRAM (alt) */
 static void mim_00D18B(void);  /* Fill tilemap buffer via DMA */
 static void mim_00D11F(void);  /* Tilemap writer */
 static void mim_008F27(void);  /* Sprite/tile DMA setup */
+static void mim_008E9D(void);  /* CGRAM/palette DMA loader */
+static void mim_00828C(void);  /* Screen fade-in */
+static void mim_00D3D2(void);  /* Shared game graphics loader */
 
 /* Forward declarations for stub functions (defined after main loop) */
 static void mim_00D24B(void);  /* Title screen */
@@ -95,8 +99,16 @@ void mim_register_all(void) {
     func_table_register(0x80D11F, (snes_func_t)mim_00D11F);
     func_table_register(0x008F27, (snes_func_t)mim_008F27);
     func_table_register(0x808F27, (snes_func_t)mim_008F27);
+    func_table_register(0x0087DF, (snes_func_t)mim_0087DF);
+    func_table_register(0x8087DF, (snes_func_t)mim_0087DF);
+    func_table_register(0x008E9D, (snes_func_t)mim_008E9D);
+    func_table_register(0x808E9D, (snes_func_t)mim_008E9D);
+    func_table_register(0x00828C, (snes_func_t)mim_00828C);
+    func_table_register(0x80828C, (snes_func_t)mim_00828C);
+    func_table_register(0x00D3D2, (snes_func_t)mim_00D3D2);
+    func_table_register(0x80D3D2, (snes_func_t)mim_00D3D2);
 
-    printf("mim: registered 31 recompiled functions (62 with mirrors)\n");
+    printf("mim: registered 36 recompiled functions (72 with mirrors)\n");
 }
 
 /*
@@ -553,12 +565,13 @@ void mim_008506(void) {
 void mim_00819D(void) {
     op_rep(0x30);
 
-    /* Reentrance guard */
-    uint16_t guard = bus_wram_read16(g_cpu.DP + 0x02);
-    bus_wram_write16(g_cpu.DP + 0x02, guard + 1);
+    /* Reentrance guard — in the recomp, NMI is called synchronously
+     * from $8249 so true reentrance can't happen. But $02 must be
+     * managed correctly since other code may check it. */
+    uint16_t guard = bus_wram_read16(0x0002);
+    bus_wram_write16(0x0002, guard + 1);
     if (guard != 0) {
-        /* Already in NMI — skip, just decrement and return */
-        bus_wram_write16(g_cpu.DP + 0x02, guard);
+        bus_wram_write16(0x0002, guard);
         return;
     }
 
@@ -616,8 +629,7 @@ void mim_00819D(void) {
     g_cpu.DP = saved_dp;
 
     /* DEC $02 — exit reentrance guard */
-    uint16_t g = bus_wram_read16(0x0002);
-    bus_wram_write16(0x0002, g - 1);
+    bus_wram_write16(0x0002, bus_wram_read16(0x0002) - 1);
 }
 
 /*
@@ -714,12 +726,16 @@ void mim_0085C0(void) {
  * The game sets this to point to different NMI handlers depending on state.
  */
 void mim_0081E1(void) {
-    uint16_t addr = bus_wram_read16(g_cpu.DP + 0x08);
-    uint8_t bank = bus_wram_read8(g_cpu.DP + 0x0A);
+    uint16_t addr = bus_wram_read16(0x0008);
+    uint8_t bank = bus_wram_read8(0x000A);
     uint32_t full = ((uint32_t)bank << 16) | addr;
 
     if (full != 0) {
-        func_table_call(full);
+        snes_func_t fn = func_table_lookup(full);
+        if (fn) {
+            fn();
+        }
+        /* Silently skip unregistered NMI vectors */
     }
 }
 
@@ -757,11 +773,23 @@ void mim_008249(void) {
 
     /* Start next frame: poll events, check quit */
     if (!snesrecomp_begin_frame()) {
+        printf("mim: quit requested, longjmp\n");
         longjmp(mim_quit_jmp, 1);
     }
 
-    /* Run NMI handler (increments frame counter, processes DMA queue) */
-    mim_00819D();
+    /* Run NMI handler only when the game has enabled NMI ($00 bit 7).
+     * When NMI is disabled, just bump the frame counter so wait loops work. */
+    uint8_t nmi_flag = bus_wram_read8(0x0000);
+    if (nmi_flag & 0x80) {
+        bus_wram_write16(0x0002, 0);
+        mim_00819D();
+    } else {
+        /* Bump frame counter */
+        uint16_t ctr = bus_wram_read16(0x0004);
+        bus_wram_write16(0x0004, ctr + 1);
+        /* Still update brightness from $01 */
+        bus_write8(0x00, 0x2100, bus_wram_read8(0x0001));
+    }
 
     /* Restore A */
     g_cpu.C = saved_a;
@@ -1228,6 +1256,134 @@ static void mim_008F27(void) {
 }
 
 /*
+ * $00:87DF — Decompress ROM data to VRAM (alt staging at $7F:F800)
+ */
+static void mim_0087DF(void) {
+    op_rep(0x20);
+    op_sep(0x10);
+
+    uint16_t vram_dest = CPU_A16();
+    bus_wram_write16(g_cpu.DP + 0x2A, vram_dest);
+
+    uint16_t src_lo = bus_wram_read16(g_cpu.DP + 0x5D);
+    uint8_t src_bank = bus_wram_read8(g_cpu.DP + 0x5F);
+
+    uint16_t data_size = bus_read16(src_bank, src_lo);
+    bus_wram_write16(g_cpu.DP + 0x2C, data_size);
+
+    bus_wram_write8(g_cpu.DP + 0x2E, 0x00);
+    bus_wram_write16(g_cpu.DP + 0x2F, 0xF800);
+    bus_wram_write8(g_cpu.DP + 0x31, 0x7F);
+
+    src_lo += 2;
+    bus_wram_write16(g_cpu.DP + 0x5D, src_lo);
+
+    /* Read and skip transfer method word */
+    src_lo += 2;
+    bus_wram_write16(g_cpu.DP + 0x5D, src_lo);
+
+    /* Decompress to WRAM $7F:F800 */
+    bus_write8(0x00, 0x2181, 0x00);
+    bus_write8(0x00, 0x2182, 0xF8);
+    bus_write8(0x00, 0x2183, 0x01);
+    g_cpu.X = 0xF800;
+    CPU_SET_A8(0x01);
+    mim_008BF5();
+
+    /* DMA to VRAM */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x18, 0x002A);
+    bus_wram_write8(g_cpu.DP + 0x1A, 0x00);
+    mim_008506();
+}
+
+/*
+ * $00:8E9D — CGRAM (palette) DMA loader
+ *
+ * Source format: [u8 cgram_addr] [u8 color_count] [count*2 bytes data]
+ */
+static void mim_008E9D(void) {
+    op_sep(0x20);
+    op_rep(0x10);
+
+    uint8_t bank = CPU_A8();
+    g_cpu.DB = bank;
+
+    uint8_t cgram_addr = bus_read8(bank, g_cpu.X);
+    bus_write8(0x00, 0x2121, cgram_addr);
+
+    uint8_t color_count = bus_read8(bank, g_cpu.X + 1);
+    uint16_t byte_count = (uint16_t)color_count << 1;
+
+    uint16_t src_data = g_cpu.X + 2;
+    bus_write8(0x00, 0x4312, (uint8_t)(src_data & 0xFF));
+    bus_write8(0x00, 0x4313, (uint8_t)(src_data >> 8));
+    bus_write8(0x00, 0x4314, bank);
+    bus_write8(0x00, 0x4315, (uint8_t)(byte_count & 0xFF));
+    bus_write8(0x00, 0x4316, (uint8_t)(byte_count >> 8));
+    bus_write8(0x00, 0x4310, 0x02);
+    bus_write8(0x00, 0x4311, 0x22);
+    bus_write8(0x00, 0x420B, 0x02);
+}
+
+/*
+ * $00:828C — Screen fade-in (0 to max brightness over 16 frames)
+ */
+static void mim_00828C(void) {
+    op_sep(0x30);
+    bus_wram_write8(g_cpu.DP + 0x01, 0x00);
+
+    /* Clear DMA ring buffer before enabling NMI to prevent
+     * $85C0 from processing garbage entries */
+    bus_wram_write8(0x0014, 0);  /* read pointer */
+    bus_wram_write8(0x0015, 0);  /* write pointer */
+
+    bus_write8(0x00, 0x4200, 0x81);
+    bus_wram_write8(g_cpu.DP + 0x00, 0x81);
+
+    for (uint8_t x = 0; x < 0x10; x++) {
+        mim_008249();
+        bus_wram_write8(g_cpu.DP + 0x01, x);
+    }
+}
+
+/*
+ * $00:D3D2 — Shared game graphics loader
+ */
+static void mim_00D3D2(void) {
+    uint8_t saved_db = g_cpu.DB;
+    g_cpu.DB = 0x00;
+    op_sep(0x20);
+    op_rep(0x10);
+
+    uint8_t param = CPU_A8();
+
+    if (!(param & 0x80)) {
+        op_rep(0x20);
+        bus_wram_write16(g_cpu.DP + 0x5D, 0xDE50);
+        bus_wram_write16(g_cpu.DP + 0x5F, 0x0091);
+        g_cpu.C = 0x3800;
+        mim_008781();
+
+        op_sep(0x20);
+        g_cpu.Y = 0x0000;
+        g_cpu.X = 0xD482;
+        CPU_SET_A8(0x80);
+        mim_008F27();
+
+        mim_00D18B();
+    }
+
+    op_rep(0x30);
+    uint16_t tilemap_src = (param == 0) ? 0xD42E : 0xD454;
+    g_cpu.X = tilemap_src;
+    g_cpu.DB = 0x80;
+    mim_00D11F();
+
+    g_cpu.DB = saved_db;
+}
+
+/*
  * $00:9203 — SPC700 communication port write
  *
  * Sends a command to the SPC700 audio processor.
@@ -1592,8 +1748,9 @@ static void mim_00D4A3(void) {
     bus_wram_write16(0x0E9F, 0x0000);
     bus_wram_write16(0x0EA1, 0x0000);
 
-    /* The real routine processes the world map and game states.
-     * For now, just set game state to continue. */
+    /* The real $D4A3 sets up and runs the world map.
+     * For now, just advance game state to loop back to title. */
+    bus_wram_write16(0x058F, 0x0004);
 }
 
 /*
@@ -1604,36 +1761,124 @@ static void mim_00D4A3(void) {
  */
 static void mim_018320(void) {
     uint16_t param = CPU_A16() & 0x0001;
-    printf("mim: STUB $01:8320 (state setup, param=%d)\n", param);
+    printf("mim: $01:8320 state setup (param=%d)\n", param);
 
     op_rep(0x30);
 
-    if (param == 0) {
-        /* State 0: set up display mode */
-        bus_wram_write16(0x12A5, g_cpu.S);  /* save stack for later */
-
-        op_sep(0x20);
-        mim_008050();
-        mim_008453();
-        mim_008471();
-        mim_00842C();
-        mim_008249();
-
-        /* Configure PPU for Mode 9 (Mode 1 + BG3 priority) */
-        bus_write8(0x00, 0x2101, 0x63);
-        bus_write8(0x00, 0x2105, 0x09);
-        bus_write8(0x00, 0x2107, 0x00);
-        bus_write8(0x00, 0x2108, 0x04);
-        bus_write8(0x00, 0x2109, 0x0A);
-        bus_write8(0x00, 0x212C, 0x17);
-        bus_write8(0x00, 0x210B, 0x22);
-        bus_write8(0x00, 0x210C, 0x33);
+    /* Save stack or $FFFF based on param */
+    if (param == 1) {
+        bus_wram_write16(0x12A5, 0xFFFF);
     } else {
-        /* State 1: additional setup */
-        op_sep(0x20);
+        bus_wram_write16(0x12A5, g_cpu.S);
     }
 
-    /* Clear carry (success) */
+    uint8_t saved_db = g_cpu.DB;
+
+    op_sep(0x20);
+
+    /* PPU init + DMA loaders + OAM init */
+    mim_008050();
+    g_cpu.DB = 0x01;  /* PHK; PLB for bank $01 */
+    mim_008453();
+    mim_008471();
+    mim_00842C();
+    mim_008249();
+
+    /* Configure PPU for Mode 9 (Mode 1 + BG3 priority) */
+    bus_write8(0x00, 0x2101, 0x63);  /* OBJ size + name base */
+    bus_write8(0x00, 0x2105, 0x09);  /* Mode 1, BG3 priority */
+    bus_write8(0x00, 0x2107, 0x00);  /* BG1 tilemap at $0000 */
+    bus_write8(0x00, 0x2108, 0x04);  /* BG2 tilemap at $0400 */
+    bus_write8(0x00, 0x2109, 0x0A);  /* BG3 tilemap at $0A00 */
+    bus_write8(0x00, 0x212C, 0x17);  /* Main screen: OBJ+BG1+BG2+BG3 */
+    bus_write8(0x00, 0x210B, 0x22);  /* BG1/2 tile base */
+    bus_write8(0x00, 0x210C, 0x33);  /* BG3/4 tile base */
+
+    /* Load BG graphics from $82:8DDB to VRAM $2000 */
+    op_rep(0x30);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0x8DDB);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0082);
+    g_cpu.C = 0x2000;
+    mim_0087DF();
+
+    /* Load more graphics from $89:FBD6 to VRAM $0400 */
+    bus_wram_write16(g_cpu.DP + 0x5D, 0xFBD6);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0089);
+    g_cpu.C = 0x0400;
+    mim_008781();
+
+    /* Load BG3 graphics from $81:8D41 to VRAM $6000 */
+    bus_wram_write16(g_cpu.DP + 0x5D, 0x8D41);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0081);
+    g_cpu.C = 0x6000;
+    mim_0087DF();
+
+    /* Load palettes from $84:FF72, $84:FF50, $84:FF2E */
+    op_sep(0x20);
+    g_cpu.X = 0xFF72;
+    CPU_SET_A8(0x84);
+    mim_008E9D();
+
+    g_cpu.X = 0xFF50;
+    CPU_SET_A8(0x84);
+    mim_008E9D();
+
+    g_cpu.X = 0xFF2E;
+    CPU_SET_A8(0x84);
+    mim_008E9D();
+
+    if (param == 1) {
+        /* Additional setup for param=1 */
+        g_cpu.X = 0xFEEC;
+        CPU_SET_A8(0x84);
+        mim_008E9D();
+
+        /* Load shared game graphics + tilemap */
+        op_rep(0x20);
+        g_cpu.C = 0x0000;
+        mim_00D3D2();
+
+        /* Transfer tilemap buffer ($7F:F000) to VRAM at BG3 tilemap ($0A00).
+         * $D3D2 wrote text to WRAM, now DMA it to VRAM. */
+        bus_write8(0x00, 0x2115, 0x80);  /* VMAIN: word increment */
+        /* BG3 tilemap register $2109=$0A → bits 7-2 = 000010 → addr $0800 */
+        bus_write8(0x00, 0x2116, 0x00);  /* VRAM addr = $0800 (BG3 tilemap) */
+        bus_write8(0x00, 0x2117, 0x08);
+        bus_write8(0x00, 0x4300, 0x01);  /* DMA mode: word, A→B */
+        bus_write8(0x00, 0x4301, 0x18);  /* B-bus = VMDATAL */
+        bus_write8(0x00, 0x4302, 0x00);  /* source = $7F:F000 */
+        bus_write8(0x00, 0x4303, 0xF0);
+        bus_write8(0x00, 0x4304, 0x7F);
+        bus_write8(0x00, 0x4305, 0x00);  /* size = $0800 (2KB tilemap) */
+        bus_write8(0x00, 0x4306, 0x08);
+        bus_write8(0x00, 0x420B, 0x01);  /* trigger DMA ch0 */
+
+        /* Only show BG3 (text layer) until BG1/2 tilemaps are properly loaded */
+        bus_write8(0x00, 0x212C, 0x14);  /* BG3 + OBJ only */
+
+        /* Screen fade-in */
+        mim_00828C();
+
+        /* Original has a 1200-frame display loop here. */
+        op_rep(0x30);
+        for (uint16_t x = 0; x < 0x04B0; x++) {
+            mim_008249();
+            if (x == 5) {
+                uint8_t wram01 = bus_wram_read8(0x0001);
+                uint8_t wram00 = bus_wram_read8(0x0000);
+                uint8_t wram02 = bus_wram_read8(0x0002);
+                printf("mim: frame 5: WRAM $00=%02X $01=%02X $02=%02X\n", wram00, wram01, wram02);
+                snesrecomp_dump_ppu("mim_attract_debug.txt");
+            }
+            uint8_t joy = bus_wram_read8(g_cpu.DP + 0x38);
+            if (joy & 0x10) break;
+        }
+    }
+
+    /* Screen disable + cleanup */
+    mim_0082A7();
+
+    g_cpu.DB = saved_db;
     g_cpu.flag_C = 0;
 }
 

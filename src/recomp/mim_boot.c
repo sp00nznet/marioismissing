@@ -16,6 +16,20 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Fast ROM read — direct pointer access instead of bus routing.
+ * LoROM: bank:addr → ROM offset = (bank & 0x7F) * 0x8000 + (addr - 0x8000) */
+static const uint8_t *s_rom = NULL;
+static uint32_t s_rom_size = 0;
+
+static inline uint8_t rom_read(uint8_t bank, uint16_t addr) {
+    if (!s_rom) {
+        s_rom = bus_get_rom(&s_rom_size);
+        if (!s_rom) return bus_read8(bank, addr);
+    }
+    uint32_t off = (uint32_t)(bank & 0x7F) * 0x8000 + (addr - 0x8000);
+    return (off < s_rom_size) ? s_rom[off] : 0;
+}
+
 /* Forward declarations for subroutines called from boot */
 static void mim_00818E(void);  /* VRAM clear */
 static void mim_00817B(void);  /* CGRAM clear */
@@ -862,8 +876,8 @@ void mim_0090AF(void) {
     g_cpu.Y = 0x0301;
     mim_009203();
 
-    /* Wait ~42 frames (original polls $4212 for VBlank 42 times) */
-    for (int i = 0; i < 42; i++) {
+    /* Wait frames for SPC700 sync (original waits 42, shortened for recomp) */
+    for (int i = 0; i < 5; i++) {
         mim_008249();
     }
 
@@ -925,51 +939,46 @@ static void mim_008BF5(void) {
     if (comp_type < 1 || comp_type > 3) return;  /* unsupported or raw */
 
     if (comp_type == 1) {
-        /* Mode 0: byte-level decompression */
+        /* Mode 0: byte-level decompression (fast path with direct ROM/WRAM access) */
         uint16_t ptr = src_lo;
+        uint8_t *wram = bus_get_wram();
+        uint32_t waddr = (uint32_t)wram_offset | ((uint32_t)wram_bank_bit << 16);
 
-        /* Read 5 dictionary bytes at src+1..src+5 */
         uint8_t dict[5];
         for (int i = 0; i < 5; i++) {
-            dict[i] = bus_read8(src_bank, ptr + 1 + i);
+            dict[i] = rom_read(src_bank, ptr + 1 + i);
         }
 
-        /* Command stream starts at src+6 */
         uint16_t y = 6;
         while (1) {
-            uint8_t cmd = bus_read8(src_bank, ptr + y);
-            if (cmd == 0) break;  /* end of stream */
+            uint8_t cmd = rom_read(src_bank, ptr + y);
+            if (cmd == 0) break;
             y++;
 
             uint8_t count = cmd & 0x1F;
-            if (count == 0) count = 32;  /* X register is count, 0 means wrapped */
+            if (count == 0) count = 32;
             uint8_t mode = cmd & 0xE0;
 
             if (mode < 0xA0) {
-                /* RLE fill from dictionary */
                 uint8_t dict_idx = (mode == 0) ? 0 : (mode >> 5);
                 uint8_t fill_val = dict[dict_idx];
                 for (int i = 0; i < count; i++) {
-                    bus_write8(0x00, 0x2180, fill_val);
+                    if (wram) wram[waddr++ & 0x1FFFF] = fill_val;
                 }
             } else if (mode == 0xA0) {
-                /* Copy literal bytes from source */
                 for (int i = 0; i < count; i++) {
-                    bus_write8(0x00, 0x2180, bus_read8(src_bank, ptr + y));
+                    if (wram) wram[waddr++ & 0x1FFFF] = rom_read(src_bank, ptr + y);
                     y++;
                 }
             } else if (mode == 0xC0) {
-                /* Incrementing fill: read seed, write count times with INC */
-                uint8_t val = bus_read8(src_bank, ptr + y);
+                uint8_t val = rom_read(src_bank, ptr + y);
                 y++;
                 for (int i = 0; i < count; i++) {
-                    bus_write8(0x00, 0x2180, val);
-                    val++;
+                    if (wram) wram[waddr++ & 0x1FFFF] = val++;
                 }
             } else {
-                /* $E0: copy literal bytes (same as $A0) */
                 for (int i = 0; i < count; i++) {
-                    bus_write8(0x00, 0x2180, bus_read8(src_bank, ptr + y));
+                    if (wram) wram[waddr++ & 0x1FFFF] = rom_read(src_bank, ptr + y);
                     y++;
                 }
             }
@@ -999,7 +1008,7 @@ static void mim_008BF5(void) {
         uint16_t y = 1;  /* skip type byte */
 
         while (1) {
-            uint8_t cmd = bus_read8(src_bank, src_lo + y);
+            uint8_t cmd = rom_read(src_bank, src_lo + y);
             if (cmd == 0) break;
             y++;
 
@@ -1007,32 +1016,24 @@ static void mim_008BF5(void) {
             uint8_t mode = cmd & 0xC0;
 
             if (mode == 0x00) {
-                /* Zero-fill count words */
                 for (int i = 0; i < count; i++) {
                     wram[0x10000 + write_off] = 0;
                     wram[0x10000 + write_off + 1] = 0;
                     write_off += 2;
                 }
             } else if (mode == 0x40) {
-                /* Copy count literal words */
                 for (int i = 0; i < count; i++) {
-                    uint8_t lo = bus_read8(src_bank, src_lo + y);
-                    uint8_t hi = bus_read8(src_bank, src_lo + y + 1);
+                    wram[0x10000 + write_off] = rom_read(src_bank, src_lo + y);
+                    wram[0x10000 + write_off + 1] = rom_read(src_bank, src_lo + y + 1);
                     y += 2;
-                    wram[0x10000 + write_off] = lo;
-                    wram[0x10000 + write_off + 1] = hi;
                     write_off += 2;
                 }
             } else if (mode == 0x80) {
-                /* Inc/dec word fill */
                 uint8_t real_count = count;
                 int decrement = 0;
-                if (count & 0x20) {
-                    real_count = count & 0x1F;
-                    decrement = 1;
-                }
-                uint16_t val = bus_read8(src_bank, src_lo + y) |
-                              (bus_read8(src_bank, src_lo + y + 1) << 8);
+                if (count & 0x20) { real_count = count & 0x1F; decrement = 1; }
+                uint16_t val = rom_read(src_bank, src_lo + y) |
+                              (rom_read(src_bank, src_lo + y + 1) << 8);
                 y += 2;
                 for (int i = 0; i < real_count; i++) {
                     wram[0x10000 + write_off] = (uint8_t)(val & 0xFF);
@@ -1041,9 +1042,8 @@ static void mim_008BF5(void) {
                     if (decrement) val--; else val++;
                 }
             } else {
-                /* $C0: constant word fill */
-                uint16_t val = bus_read8(src_bank, src_lo + y) |
-                              (bus_read8(src_bank, src_lo + y + 1) << 8);
+                uint16_t val = rom_read(src_bank, src_lo + y) |
+                              (rom_read(src_bank, src_lo + y + 1) << 8);
                 y += 2;
                 for (int i = 0; i < count; i++) {
                     wram[0x10000 + write_off] = (uint8_t)(val & 0xFF);
@@ -1078,39 +1078,41 @@ static void mim_008BF5(void) {
         uint16_t data_pos = ptr + 2;
         uint16_t y = 0;  /* offset into data from data_pos */
         int bits_left = 8;
-        uint8_t ctrl = bus_read8(src_bank, ctrl_pos);
+        uint8_t ctrl = rom_read(src_bank, ctrl_pos);
+
+        /* Track WRAM write address (mirrors what $2180 port does).
+         * The WRAM address was set by the caller via $2181-$2183. */
+        uint32_t wram_write_addr = (uint32_t)wram_offset |
+            ((uint32_t)wram_bank_bit << 16);
 
         while (1) {
-            /* Shift out next bit */
             int bit = (ctrl >> 7) & 1;
             ctrl <<= 1;
 
             if (bit) {
-                /* Literal byte */
-                uint8_t val = bus_read8(src_bank, data_pos + y);
+                uint8_t val = rom_read(src_bank, data_pos + y);
                 y++;
-                bus_write8(0x00, 0x2180, val);
+                /* Direct WRAM write (much faster than bus_write8) */
+                wram[wram_write_addr & 0x1FFFF] = val;
+                wram_write_addr++;
                 ring[ring_write] = val;
                 ring_write = (ring_write + 1) & 0x0FFF;
                 total_output++;
             } else {
-                /* Back-reference: read 2-byte descriptor */
-                uint8_t byte0 = bus_read8(src_bank, data_pos + y);
-                uint8_t byte1 = bus_read8(src_bank, data_pos + y + 1);
+                uint8_t byte0 = rom_read(src_bank, data_pos + y);
+                uint8_t byte1 = rom_read(src_bank, data_pos + y + 1);
                 uint16_t ref16 = (uint16_t)byte0 | ((uint16_t)byte1 << 8);
 
-                if (ref16 == 0) break;  /* end of stream */
+                if (ref16 == 0) break;
                 y += 2;
 
-                /* Decode: after XBA, value = byte1 | (byte0 << 8)
-                 * ring_offset = (byte1 | (byte0 << 8)) >> 4 = (byte0 << 4) | (byte1 >> 4)
-                 * length = (byte1 & 0x0F) + 2 */
                 uint16_t ring_read = ((byte0 << 4) | (byte1 >> 4)) & 0x0FFF;
                 int length = (byte1 & 0x0F) + 2;
 
                 for (int i = 0; i < length; i++) {
                     uint8_t val = ring[ring_read];
-                    bus_write8(0x00, 0x2180, val);
+                    wram[wram_write_addr & 0x1FFFF] = val;
+                    wram_write_addr++;
                     ring[ring_write] = val;
                     ring_write = (ring_write + 1) & 0x0FFF;
                     ring_read = (ring_read + 1) & 0x0FFF;
@@ -1847,16 +1849,12 @@ static void mim_00D24B(void) {
     /* Enable NMI */
     bus_wram_write8(g_cpu.DP + 0x00, 0x81);
 
-    /* Display loop: wait up to 480 frames, exit on Start button */
-    for (uint16_t x = 0; x < 0x01E0; x++) {
+    /* Display loop: wait up to 120 frames (2 sec), exit on any button */
+    for (uint16_t x = 0; x < 120; x++) {
         g_cpu.X = x;
         mim_008249();
-
-        if (x >= 0x00F0) {
-            /* Check joypad at WRAM $38 for Start button (bit 4) */
-            uint8_t joy = bus_wram_read8(g_cpu.DP + 0x38);
-            if (joy & 0x10) break;
-        }
+        uint8_t joy = bus_wram_read8(0x0038);
+        if (joy & 0xF0) break;  /* any face button */
     }
 
     /* Clean up */
@@ -1872,20 +1870,118 @@ static void mim_00D24B(void) {
  * Handles the world map, city selection, and game state transitions.
  * Very large routine with many subroutines.
  */
+/*
+ * $00:D8A1 — Gameplay PPU setup
+ *
+ * Sets up Mode 1 display for the gameplay screen with
+ * different tilemap/tile base addresses than the menu.
+ */
+static void mim_00D8A1(void) {
+    op_sep(0x20);
+    op_rep(0x10);
+
+    /* Call DMA loaders and OAM init */
+    mim_008453();
+    mim_00842C();
+
+    /* Set NMI indirect vector to game-specific handler $80:D614 */
+    bus_wram_write16(0x0008, 0xD614);
+    bus_wram_write8(0x000A, 0x80);
+
+    /* Mode 1 */
+    bus_write8(0x00, 0x2105, 0x01);
+
+    /* BG tilemap addresses (with 64x32 size bit) */
+    bus_write8(0x00, 0x2107, 0x21);  /* BG1 at $2000, 64x32 */
+    bus_write8(0x00, 0x2108, 0x29);  /* BG2 at $2800, 64x32 */
+    bus_write8(0x00, 0x2109, 0x19);  /* BG3 at $1800, 64x32 */
+
+    /* BG tile base addresses */
+    bus_write8(0x00, 0x210B, 0x33);  /* BG1=$3000, BG2=$3000 */
+    bus_write8(0x00, 0x210C, 0x06);  /* BG3=$6000 */
+
+    /* OBJ settings */
+    bus_write8(0x00, 0x2101, 0x00);
+
+    /* Enable all layers */
+    bus_write8(0x00, 0x212C, 0x17);
+
+    /* Load palettes via $8E9D */
+    op_sep(0x20);
+    g_cpu.X = 0xB5FB;
+    CPU_SET_A8(0x84);
+    mim_008E9D();
+}
+
 static void mim_00D4A3(void) {
-    printf("mim: STUB $00:D4A3 (game state machine)\n");
+    printf("mim: $00:D4A3 game state machine\n"); fflush(stdout);
+
+    uint8_t saved_db = g_cpu.DB;
+    g_cpu.DB = 0x00;
     op_rep(0x30);
 
-    /* Call $90AF for VBlank sync */
+    /* $90AF — VBlank wait + SPC sync */
     mim_0090AF();
 
-    /* Initialize some game state variables */
+    /* Initialize animation counters */
     bus_wram_write16(0x0E9F, 0x0000);
     bus_wram_write16(0x0EA1, 0x0000);
 
-    /* The real $D4A3 sets up and runs the world map.
-     * For now, just advance game state to loop back to title. */
+    /* $D87E — Play music based on world ($0504) */
+    {
+        uint16_t world = bus_wram_read16(0x0504);
+        op_rep(0x30);
+        CPU_SET_A8(0x06);
+        g_cpu.Y = 0x0007;
+        mim_009203();
+
+        CPU_SET_A8(0x12);
+        g_cpu.Y = 0x0301;
+        mim_009203();
+    }
+
+    /* $D8A1 — Gameplay PPU setup */
+    mim_00D8A1();
+
+    /* Initialize game state variables */
+    uint16_t state_0591 = bus_wram_read16(0x0591);
+    if (state_0591 != 0x0001) {
+        /* Default state setup */
+        bus_wram_write16(0x0E43, 0x0005);
+        bus_wram_write16(0x088B, 0x0000);
+        bus_wram_write16(0x0DC3, 0x0000);
+        bus_wram_write16(0x07B3, 0x0003);
+        bus_wram_write16(0x0593, 0x0005);
+    }
+
+    /* Common setup */
+    bus_wram_write16(0x0BB5, 0xFFFF);
+    bus_wram_write16(0x0711, 0x0000);
+    bus_wram_write16(0x06DB, 0x0000);
+    bus_wram_write16(0x06A5, 0x0001);
+
+    /* Screen fade-in */
+    mim_00828C();
+
+    /* Gameplay display loop — show whatever is rendered */
+    printf("mim: entering gameplay loop\n"); fflush(stdout);
+    bus_wram_write16(0x067F, 0x0000);
+    for (int frame = 0; frame < 1800; frame++) {
+        mim_008249();
+
+        /* Increment frame counter */
+        uint16_t fc = bus_wram_read16(0x067F);
+        bus_wram_write16(0x067F, fc + 1);
+
+        /* Check Start button to exit */
+        uint8_t joy = bus_wram_read8(0x0038);
+        if (joy & 0x10) break;
+    }
+
+    /* Set state to loop back */
     bus_wram_write16(0x058F, 0x0004);
+
+    g_cpu.DB = saved_db;
 }
 
 /*
@@ -2006,16 +2102,15 @@ static void mim_018320(void) {
 
         /* Menu display loop with cursor selection */
         op_rep(0x30);
-        uint8_t cursor_pos = 0;  /* 0 = SEARCH FOR MARIO, 1 = CONTINUE SEARCH */
-        uint8_t prev_cursor = 0xFF;  /* force initial draw */
+        uint8_t cursor_pos = 0;
+        uint8_t prev_cursor = 0xFF;
 
         for (uint16_t x = 0; x < 0x04B0; x++) {
             /* Update cursor display when position changes */
             if (cursor_pos != prev_cursor) {
-                /* Set $05ED so $D3D2/$869B can adjust the speech bubble */
                 bus_wram_write16(0x05ED, cursor_pos == 0 ? 0x0000 : 0x0001);
 
-                /* Clear tilemap buffer and redraw with correct highlight */
+                /* Redraw BG3 text with correct highlight */
                 mim_00D18B();
                 g_cpu.X = (cursor_pos == 0) ? 0xD42E : 0xD454;
                 g_cpu.DB = 0x80;
@@ -2038,6 +2133,7 @@ static void mim_018320(void) {
                 prev_cursor = cursor_pos;
             }
 
+            /* Just wait for frame — no per-frame decompression needed */
             mim_008249();
 
             /* Read joypad — use newly-pressed buttons for cursor,
@@ -2232,8 +2328,8 @@ static void mim_028000(void) {
     bus_wram_write16(0x1219, 0x0000);
     bus_wram_write16(0x0E9F, 0x0000);
 
-    /* Run some frames so sprites/tiles can load */
-    for (int i = 0; i < 60; i++) {
+    /* Run a few frames for setup */
+    for (int i = 0; i < 5; i++) {
         mim_028A1C();
     }
 

@@ -1943,8 +1943,8 @@ static void mim_00D8A1(void) {
     /* OBJ settings */
     bus_write8(0x00, 0x2101, 0x00);
 
-    /* Enable BG2 + BG3 + OBJ (BG1 tilemap not loaded yet) */
-    bus_write8(0x00, 0x212C, 0x16);
+    /* Enable all layers — BG1 tile 0 should be transparent */
+    bus_write8(0x00, 0x212C, 0x17);
 
     /* Load palette from $84:B5FB to CGRAM $00 via $8EE4 */
     op_sep(0x20);

@@ -43,7 +43,8 @@ static void mim_0087DF(void);  /* Decompress + DMA to VRAM (alt) */
 static void mim_00D18B(void);  /* Fill tilemap buffer via DMA */
 static void mim_00D11F(void);  /* Tilemap writer */
 static void mim_008F27(void);  /* Sprite/tile DMA setup */
-static void mim_008E9D(void);  /* CGRAM/palette DMA loader */
+static void mim_008E9D(void);  /* CGRAM/palette DMA loader (addr from source) */
+static void mim_008EE4(void);  /* CGRAM/palette DMA loader (addr from Y) */
 static void mim_00828C(void);  /* Screen fade-in */
 static void mim_00D3D2(void);  /* Shared game graphics loader */
 
@@ -1435,7 +1436,46 @@ static void mim_0087DF(void) {
 }
 
 /*
- * $00:8E9D — CGRAM (palette) DMA loader
+ * $00:8EE4 — CGRAM (palette) DMA loader (Y = CGRAM addr)
+ *
+ * Entry: A = bank, X = source addr, Y = CGRAM start address.
+ * Source format: [u8 color_count] [count*2 bytes palette data]
+ */
+static void mim_008EE4(void) {
+    op_sep(0x20);
+    op_rep(0x10);
+
+    uint8_t bank = CPU_A8();
+    g_cpu.DB = bank;
+
+    /* CGRAM address from Y */
+    bus_write8(0x00, 0x2121, (uint8_t)(g_cpu.Y & 0xFF));
+
+    /* Color count from source[0] */
+    uint8_t color_count = bus_read8(bank, g_cpu.X);
+    uint16_t byte_count;
+    if (color_count >= 0x80) {
+        byte_count = (uint16_t)color_count << 1;
+        bus_write8(0x00, 0x4315, (uint8_t)(byte_count & 0xFF));
+        bus_write8(0x00, 0x4316, 0x01);
+    } else {
+        byte_count = (uint16_t)color_count << 1;
+        bus_write8(0x00, 0x4315, (uint8_t)(byte_count & 0xFF));
+        bus_write8(0x00, 0x4316, 0x00);
+    }
+
+    /* DMA source = source + 1 (past count byte) */
+    uint16_t src_data = g_cpu.X + 1;
+    bus_write8(0x00, 0x4312, (uint8_t)(src_data & 0xFF));
+    bus_write8(0x00, 0x4313, (uint8_t)(src_data >> 8));
+    bus_write8(0x00, 0x4314, bank);
+    bus_write8(0x00, 0x4310, 0x02);
+    bus_write8(0x00, 0x4311, 0x22);
+    bus_write8(0x00, 0x420B, 0x02);
+}
+
+/*
+ * $00:8E9D — CGRAM (palette) DMA loader (addr from source data)
  *
  * Source format: [u8 cgram_addr] [u8 color_count] [count*2 bytes data]
  */
@@ -1903,15 +1943,15 @@ static void mim_00D8A1(void) {
     /* OBJ settings */
     bus_write8(0x00, 0x2101, 0x00);
 
-    /* Enable all layers */
-    bus_write8(0x00, 0x212C, 0x17);
+    /* Enable BG2 + BG3 + OBJ (BG1 tilemap not loaded yet) */
+    bus_write8(0x00, 0x212C, 0x16);
 
-    /* Load sprite palette from $84:B5FB via $8EE4 (similar to $8E9D) */
+    /* Load palette from $84:B5FB to CGRAM $00 via $8EE4 */
     op_sep(0x20);
     g_cpu.Y = 0x0000;
     g_cpu.X = 0xB5FB;
     CPU_SET_A8(0x84);
-    mim_008E9D();
+    mim_008EE4();
 
     /* Load BG tiles from $84:8000 to VRAM $3000 */
     op_rep(0x20);
@@ -1955,17 +1995,17 @@ static void mim_00D8A1(void) {
     g_cpu.C = 0x1CC0;
     mim_008781();
 
-    /* Load more palettes from $81:E83F and $85:FF0D */
+    /* Load more palettes from $81:E83F and $85:FF0D via $8EE4 */
     op_sep(0x20);
     g_cpu.Y = 0x0080;
     g_cpu.X = 0xE83F;
     CPU_SET_A8(0x81);
-    mim_008E9D();
+    mim_008EE4();
 
     g_cpu.Y = 0x00F0;
     g_cpu.X = 0xFF0D;
     CPU_SET_A8(0x85);
-    mim_008E9D();
+    mim_008EE4();
 
     /* Load tilemap from $84:B6FC to VRAM $1000 */
     op_rep(0x20);

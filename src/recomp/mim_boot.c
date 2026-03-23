@@ -794,11 +794,23 @@ void mim_008249(void) {
         bus_wram_write16(0x0002, 0);
         mim_00819D();
     } else {
-        /* Bump frame counter */
         uint16_t ctr = bus_wram_read16(0x0004);
         bus_wram_write16(0x0004, ctr + 1);
-        /* Still update brightness from $01 */
         bus_write8(0x00, 0x2100, bus_wram_read8(0x0001));
+    }
+
+    /* Read joypad — auto-joypad result at $4218-$4219.
+     * High byte ($4219): B Y Sel Start Up Down Left Right
+     * Store current state at $36-$37, new presses at $38. */
+    {
+        uint16_t prev = bus_wram_read16(0x0036);
+        uint8_t joy_hi = bus_read8(0x00, 0x4219);
+        uint8_t joy_lo = bus_read8(0x00, 0x4218);
+        uint16_t curr = (uint16_t)(joy_hi << 8) | joy_lo;
+        uint16_t newly = curr & ~prev;
+        bus_wram_write16(0x0036, curr);
+        bus_wram_write8(0x0038, (uint8_t)(newly >> 8));
+        bus_wram_write8(0x0039, (uint8_t)(newly & 0xFF));
     }
 
     /* Restore A */
@@ -1986,20 +1998,64 @@ static void mim_018320(void) {
         /* Load initial background via $869B before fade-in */
         mim_01869B();
 
-        /* Enable BG1 (background) + BG3 (text) + OBJ */
-        bus_write8(0x00, 0x212C, 0x15);  /* BG1 + BG3 + OBJ */
+        /* Enable BG1 + BG2 + BG3 + OBJ (full display) */
+        bus_write8(0x00, 0x212C, 0x17);
 
         /* Screen fade-in */
         mim_00828C();
 
-        /* Menu display loop — call $869B per frame for background updates */
+        /* Menu display loop with cursor selection */
         op_rep(0x30);
+        uint8_t cursor_pos = 0;  /* 0 = SEARCH FOR MARIO, 1 = CONTINUE SEARCH */
+        uint8_t prev_cursor = 0xFF;  /* force initial draw */
+
         for (uint16_t x = 0; x < 0x04B0; x++) {
-            if (x == 3) snesrecomp_dump_ppu("mim_menu_debug.txt");
-            mim_01869B();
-            /* Check for Start ($10) or A ($80) button */
-            uint8_t joy = bus_wram_read8(0x0038);
-            if (joy & 0x90) break;
+            /* Update cursor display when position changes */
+            if (cursor_pos != prev_cursor) {
+                /* Set $05ED so $D3D2/$869B can adjust the speech bubble */
+                bus_wram_write16(0x05ED, cursor_pos == 0 ? 0x0000 : 0x0001);
+
+                /* Clear tilemap buffer and redraw with correct highlight */
+                mim_00D18B();
+                g_cpu.X = (cursor_pos == 0) ? 0xD42E : 0xD454;
+                g_cpu.DB = 0x80;
+                mim_00D11F();
+                g_cpu.DB = 0x00;
+
+                /* DMA tilemap buffer to VRAM $0800 (BG3) */
+                bus_write8(0x00, 0x2115, 0x80);
+                bus_write8(0x00, 0x2116, 0x00);
+                bus_write8(0x00, 0x2117, 0x08);
+                bus_write8(0x00, 0x4300, 0x01);
+                bus_write8(0x00, 0x4301, 0x18);
+                bus_write8(0x00, 0x4302, 0x00);
+                bus_write8(0x00, 0x4303, 0xF0);
+                bus_write8(0x00, 0x4304, 0x7F);
+                bus_write8(0x00, 0x4305, 0x00);
+                bus_write8(0x00, 0x4306, 0x08);
+                bus_write8(0x00, 0x420B, 0x01);
+
+                prev_cursor = cursor_pos;
+            }
+
+            mim_008249();
+
+            /* Read joypad — use newly-pressed buttons for cursor,
+             * check both new ($38) and held ($36 high byte) for robustness */
+            uint8_t joy_new = bus_wram_read8(0x0038);
+
+            /* D-pad up/down to change selection (newly pressed) */
+            if (joy_new & 0x08) { cursor_pos = 0; }  /* Up → SEARCH */
+            if (joy_new & 0x04) { cursor_pos = 1; }  /* Down → CONTINUE */
+
+            /* A or Start to confirm (newly pressed) */
+            if (joy_new & 0x90) {
+                printf("mim: menu selection: %s\n",
+                       cursor_pos == 0 ? "SEARCH FOR MARIO" : "CONTINUE SEARCH");
+                /* Set game state based on selection */
+                bus_wram_write16(0x058D, cursor_pos == 0 ? 0x0000 : 0x0001);
+                break;
+            }
         }
     }
 

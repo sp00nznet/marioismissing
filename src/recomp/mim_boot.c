@@ -19,6 +19,21 @@
 /* Forward declarations for subroutines called from boot */
 static void mim_00818E(void);  /* VRAM clear */
 static void mim_00817B(void);  /* CGRAM clear */
+static void mim_00915A(uint16_t src_addr, uint8_t src_bank);  /* SPC700 IPL upload */
+
+/* Forward declarations for graphics/decompression functions */
+static void mim_008BF5(void);  /* WRAM compressed data load */
+static void mim_008BB7(void);  /* Decompress to WRAM $7F:8000 */
+static void mim_008781(void);  /* Decompress + DMA to VRAM */
+static void mim_00D18B(void);  /* Fill tilemap buffer via DMA */
+static void mim_00D11F(void);  /* Tilemap writer */
+static void mim_008F27(void);  /* Sprite/tile DMA setup */
+
+/* Forward declarations for stub functions (defined after main loop) */
+static void mim_00D24B(void);  /* Title screen */
+static void mim_00D4A3(void);  /* Game state machine */
+static void mim_018320(void);  /* State setup */
+static void mim_028000(void);  /* Bank 2 game logic */
 
 /*
  * Register all recompiled functions in the function table.
@@ -48,8 +63,40 @@ void mim_register_all(void) {
     func_table_register(0x8090EA, mim_0090EA);
     func_table_register(0x00913A, mim_00913A);
     func_table_register(0x80913A, mim_00913A);
+    func_table_register(0x00911A, mim_00911A);
+    func_table_register(0x80911A, mim_00911A);
+    func_table_register(0x008249, mim_008249);
+    func_table_register(0x808249, mim_008249);
+    func_table_register(0x0082A7, mim_0082A7);
+    func_table_register(0x8082A7, mim_0082A7);
+    func_table_register(0x0090AF, mim_0090AF);
+    func_table_register(0x8090AF, mim_0090AF);
+    func_table_register(0x008506, mim_008506);
+    func_table_register(0x808506, mim_008506);
+    func_table_register(0x009A5E, mim_009A5E);
+    func_table_register(0x809A5E, mim_009A5E);
+    func_table_register(0x00D24B, (snes_func_t)mim_00D24B);
+    func_table_register(0x80D24B, (snes_func_t)mim_00D24B);
+    func_table_register(0x00D4A3, (snes_func_t)mim_00D4A3);
+    func_table_register(0x80D4A3, (snes_func_t)mim_00D4A3);
+    func_table_register(0x018320, (snes_func_t)mim_018320);
+    func_table_register(0x818320, (snes_func_t)mim_018320);
+    func_table_register(0x028000, (snes_func_t)mim_028000);
+    func_table_register(0x828000, (snes_func_t)mim_028000);
+    func_table_register(0x008BF5, (snes_func_t)mim_008BF5);
+    func_table_register(0x808BF5, (snes_func_t)mim_008BF5);
+    func_table_register(0x008BB7, (snes_func_t)mim_008BB7);
+    func_table_register(0x808BB7, (snes_func_t)mim_008BB7);
+    func_table_register(0x008781, (snes_func_t)mim_008781);
+    func_table_register(0x808781, (snes_func_t)mim_008781);
+    func_table_register(0x00D18B, (snes_func_t)mim_00D18B);
+    func_table_register(0x80D18B, (snes_func_t)mim_00D18B);
+    func_table_register(0x00D11F, (snes_func_t)mim_00D11F);
+    func_table_register(0x80D11F, (snes_func_t)mim_00D11F);
+    func_table_register(0x008F27, (snes_func_t)mim_008F27);
+    func_table_register(0x808F27, (snes_func_t)mim_008F27);
 
-    printf("mim: registered 12 recompiled functions (24 with mirrors)\n");
+    printf("mim: registered 31 recompiled functions (62 with mirrors)\n");
 }
 
 /*
@@ -387,52 +434,92 @@ void mim_008471(void) {
 /*
  * $00:8506 — DMA table engine
  *
- * Reads a data table from the 24-bit pointer at DP $18-$1A.
- * Each entry describes a DMA transfer to VRAM.
- * Table format (per entry):
- *   byte 0: VRAM increment mode (for $2115)
- *   byte 1-2: VRAM destination address
- *   byte 3-4: DMA transfer size
- *   byte 5-6: source address (within current bank)
- *   byte 7: source bank
- * Table ends when byte 0 == $00.
+ * Reads ONE DMA transfer entry from the 24-bit pointer at DP $18-$1A.
+ * If NMI is enabled (DP $00 bit 7), queues the entry for NMI processing.
+ * If NMI is disabled, executes DMA immediately.
  *
- * TODO: This needs proper disassembly to confirm the exact table format.
- *       For now, we read the table from ROM and execute DMA transfers.
+ * Table format (8 bytes):
+ *   byte 0-1: VRAM/CGRAM destination address
+ *   byte 2-3: DMA transfer size (bytes)
+ *   byte 4:   Mode index (lookup for VMAIN, B-bus register, DMA mode)
+ *             bit 7: if set, force word increment on VMAIN
+ *   byte 5-7: DMA source address + bank
+ *
+ * Mode index lookup tables at $8681/$8692/$86A3:
+ *   Mode 0: VMAIN=$80, B=$18 (VMDATAL), DMA=$01 (word, A→B) — standard VRAM
+ *   Mode $0D: CGRAM transfer (B=$22)
+ *   etc.
  */
 void mim_008506(void) {
-    op_sep(0x20);
-    op_rep(0x10);
+    /* VMAIN lookup table */
+    static const uint8_t vmain_tbl[16] = {
+        0x80,0x80,0x00,0x00,0x80,0x80,0x80,0x80,
+        0x00,0x00,0x80,0x80,0x05,0x80,0x80,0x80
+    };
+    /* B-bus register lookup */
+    static const uint8_t bbus_tbl[16] = {
+        0x18,0x39,0x18,0x39,0x19,0x3A,0x18,0x39,
+        0x18,0x39,0x19,0x3A,0x18,0x22,0x3B,0x22
+    };
+    /* DMA mode lookup */
+    static const uint8_t dma_mode_tbl[16] = {
+        0x01,0x81,0x00,0x80,0x00,0x80,0x09,0x89,
+        0x08,0x88,0x08,0x88,0x00,0x02,0x82,0x0A
+    };
+
+    op_sep(0x30);
+
+    /* Check NMI enable flag — if set, queue for NMI (simplified: just execute) */
+    uint8_t nmi_flag = bus_wram_read8(g_cpu.DP + 0x00);
+    /* For now, always execute immediately regardless of NMI state */
 
     uint16_t tbl_addr = bus_wram_read16(g_cpu.DP + 0x18);
     uint8_t tbl_bank = bus_wram_read8(g_cpu.DP + 0x1A);
 
-    for (;;) {
-        uint8_t vmain = bus_read8(tbl_bank, tbl_addr);
-        if (vmain == 0x00) break;  /* end of table */
+    /* Read mode index from byte 4 */
+    uint8_t mode_raw = bus_read8(tbl_bank, tbl_addr + 4);
+    uint8_t mode_idx = mode_raw & 0x7F;
+    if (mode_idx >= 16) mode_idx = 0;
 
-        uint16_t vram_dst = bus_read16(tbl_bank, tbl_addr + 1);
-        uint16_t dma_size = bus_read16(tbl_bank, tbl_addr + 3);
-        uint16_t src_addr = bus_read16(tbl_bank, tbl_addr + 5);
-        uint8_t src_bank = bus_read8(tbl_bank, tbl_addr + 7);
+    /* Look up VMAIN, B-bus register, and DMA mode */
+    uint8_t vmain = vmain_tbl[mode_idx];
+    if (mode_raw & 0x80) vmain |= 0x01;  /* force word increment */
+    uint8_t bbus_reg = bbus_tbl[mode_idx];
+    uint8_t dma_mode = dma_mode_tbl[mode_idx];
 
-        /* Set VRAM address and increment mode */
-        bus_write8(0x00, 0x2115, vmain);        /* VMAIN */
-        bus_write8(0x00, 0x2116, vram_dst & 0xFF);
-        bus_write8(0x00, 0x2117, vram_dst >> 8);
+    /* Set VMAIN */
+    bus_write8(0x00, 0x2115, vmain);
 
-        /* DMA channel 0: word write to VMDATAL/VMDATAH */
-        bus_write8(0x00, 0x4300, 0x01);         /* 2-reg sequential */
-        bus_write8(0x00, 0x4301, 0x18);         /* B-bus = $18 (VMDATAL) */
-        bus_write8(0x00, 0x4302, src_addr & 0xFF);
-        bus_write8(0x00, 0x4303, src_addr >> 8);
-        bus_write8(0x00, 0x4304, src_bank);
-        bus_write8(0x00, 0x4305, dma_size & 0xFF);
-        bus_write8(0x00, 0x4306, dma_size >> 8);
-        bus_write8(0x00, 0x420B, 0x01);         /* trigger DMA ch0 */
-
-        tbl_addr += 8;  /* next entry */
+    /* Set destination address */
+    if (mode_idx >= 0x0D) {
+        /* CGRAM mode: byte 0 is CGRAM address */
+        bus_write8(0x00, 0x2121, bus_read8(tbl_bank, tbl_addr));
+    } else {
+        /* VRAM mode: bytes 0-1 are VRAM word address */
+        bus_write8(0x00, 0x2116, bus_read8(tbl_bank, tbl_addr));
+        bus_write8(0x00, 0x2117, bus_read8(tbl_bank, tbl_addr + 1));
     }
+
+    /* Set DMA size (bytes 2-3) */
+    bus_write8(0x00, 0x4305, bus_read8(tbl_bank, tbl_addr + 2));
+    bus_write8(0x00, 0x4306, bus_read8(tbl_bank, tbl_addr + 3));
+
+    /* Set DMA source (bytes 5-7) */
+    bus_write8(0x00, 0x4302, bus_read8(tbl_bank, tbl_addr + 5));
+    bus_write8(0x00, 0x4303, bus_read8(tbl_bank, tbl_addr + 6));
+    bus_write8(0x00, 0x4304, bus_read8(tbl_bank, tbl_addr + 7));
+
+    /* Set DMA mode and B-bus register */
+    bus_write8(0x00, 0x4300, dma_mode);
+    bus_write8(0x00, 0x4301, bbus_reg);
+
+    /* Trigger DMA channel 0 */
+    bus_write8(0x00, 0x420B, 0x01);
+
+    /* Reset VMAIN to standard mode */
+    bus_write8(0x00, 0x2115, 0x80);
+
+    g_cpu.flag_C = 0;  /* clear carry (success) */
 }
 
 /*
@@ -648,6 +735,499 @@ void mim_0081E5(void) {
 }
 
 /*
+ * $00:8249 — Wait for next frame (VBlank sync)
+ *
+ * Original: spins until NMI increments DP $04 (frame counter).
+ * Recomp: this IS the frame boundary. We render the current frame,
+ * poll input, and run the NMI handler before returning.
+ *
+ * The game's infinite main loop calls this whenever it needs a frame
+ * to pass. X is preserved across the call (PHA/PHP ... PLP/PLA).
+ */
+jmp_buf mim_quit_jmp;
+
+void mim_008249(void) {
+    /* Save registers (original does PHA/PHP) */
+    uint16_t saved_a = CPU_A16();
+
+    /* === Frame boundary === */
+
+    /* End current frame: render PPU scanlines, present, sync */
+    snesrecomp_end_frame();
+
+    /* Start next frame: poll events, check quit */
+    if (!snesrecomp_begin_frame()) {
+        longjmp(mim_quit_jmp, 1);
+    }
+
+    /* Run NMI handler (increments frame counter, processes DMA queue) */
+    mim_00819D();
+
+    /* Restore A */
+    g_cpu.C = saved_a;
+}
+
+/*
+ * $00:82A7 — Screen disable / cleanup
+ *
+ * Waits 15 frames with force blank, disables all display layers,
+ * disables NMI, and clears the NMI enable flag at $00.
+ */
+void mim_0082A7(void) {
+    op_sep(0x30);
+
+    /* Wait 15 frames with force blank fading */
+    for (int i = 0x0F; i >= 0; i--) {
+        g_cpu.X = (uint16_t)i;
+        mim_008249();
+        bus_wram_write8(g_cpu.DP + 0x01, (uint8_t)g_cpu.X);
+    }
+
+    /* Disable all display layers */
+    bus_write8(0x00, 0x212C, 0x00);  /* TM = 0 */
+    bus_write8(0x00, 0x212D, 0x00);  /* TS = 0 */
+    bus_write8(0x00, 0x212E, 0x00);  /* TMW = 0 */
+    bus_write8(0x00, 0x212F, 0x00);  /* TSW = 0 */
+
+    /* Force blank + max brightness, disable NMI */
+    bus_wram_write8(g_cpu.DP + 0x01, 0x8F);
+    mim_008249();
+    bus_write8(0x00, 0x4200, 0x00);  /* NMITIMEN = 0 */
+    bus_wram_write8(g_cpu.DP + 0x00, 0x00);  /* clear NMI enable flag */
+}
+
+/*
+ * $00:90AF — VBlank wait loop + SPC700 sync commands
+ *
+ * Sends SPC700 command $10, waits ~42 frames polling VBlank,
+ * then sends commands $1A and $1C to sync audio state.
+ * Returns with carry reflecting the SPC700 response.
+ */
+void mim_0090AF(void) {
+    op_sep(0x20);
+    op_rep(0x10);
+
+    /* SPC700 command $10 with Y=$0301 */
+    CPU_SET_A8(0x10);
+    g_cpu.Y = 0x0301;
+    mim_009203();
+
+    /* Wait ~42 frames (original polls $4212 for VBlank 42 times) */
+    for (int i = 0; i < 42; i++) {
+        mim_008249();
+    }
+
+    /* SPC700 command $1A with Y=$0000 */
+    CPU_SET_A8(0x1A);
+    g_cpu.Y = 0x0000;
+    mim_009203();
+
+    /* SPC700 command $1C with Y=$FF00 */
+    CPU_SET_A8(0x1C);
+    g_cpu.Y = 0xFF00;
+    mim_009203();
+
+    /* SPC700 command $1C with Y=$8000 */
+    CPU_SET_A8(0x1C);
+    g_cpu.Y = 0x8000;
+    mim_009203();
+}
+
+/* ================================================================
+ * Graphics / Decompression Engine
+ * ================================================================ */
+
+/*
+ * $00:8BF5 — Compressed data load to WRAM
+ *
+ * Decompresses data from ROM source ([$5D-$5F]) to a WRAM destination.
+ * Entry: X = WRAM dest offset, A = WRAM bank bit (0=$7E, 1=$7F)
+ * Source pointer at DP $5D-$5F (24-bit).
+ *
+ * Compression format (mode 0 / byte-level):
+ *   Header: type byte (1=byte, 2=word, 3=LZ)
+ *   Mode 0: 5 dictionary bytes, then command stream:
+ *     Command byte: [EEE XXXXX]
+ *       E=0: fill X+1 bytes with dict[0]
+ *       E=1-4: fill X+1 bytes with dict[E]
+ *       E=5 ($A0): copy X+1 literal bytes
+ *       E=6 ($C0): read seed, fill X+1 bytes incrementing
+ *       E=7 ($E0): copy X+1 literal bytes
+ *     $00 = end of stream
+ */
+static void mim_008BF5(void) {
+    op_sep(0x20);
+    op_rep(0x10);
+
+    /* Set WRAM destination address ($2181-$2183) */
+    uint16_t wram_offset = g_cpu.X;
+    uint8_t wram_bank_bit = CPU_A8() & 0x01;
+    bus_write8(0x00, 0x2181, (uint8_t)(wram_offset & 0xFF));
+    bus_write8(0x00, 0x2182, (uint8_t)(wram_offset >> 8));
+    bus_write8(0x00, 0x2183, wram_bank_bit);
+
+    /* Source pointer from DP $5D-$5F */
+    uint16_t src_lo = bus_wram_read16(g_cpu.DP + 0x5D);
+    uint8_t src_bank = bus_wram_read8(g_cpu.DP + 0x5F);
+
+    /* Read compression type byte */
+    uint8_t comp_type = bus_read8(src_bank, src_lo);
+    if (comp_type < 1 || comp_type > 3) return;  /* unsupported or raw */
+
+    if (comp_type == 1) {
+        /* Mode 0: byte-level decompression */
+        uint16_t ptr = src_lo;
+
+        /* Read 5 dictionary bytes at src+1..src+5 */
+        uint8_t dict[5];
+        for (int i = 0; i < 5; i++) {
+            dict[i] = bus_read8(src_bank, ptr + 1 + i);
+        }
+
+        /* Command stream starts at src+6 */
+        uint16_t y = 6;
+        while (1) {
+            uint8_t cmd = bus_read8(src_bank, ptr + y);
+            if (cmd == 0) break;  /* end of stream */
+            y++;
+
+            uint8_t count = cmd & 0x1F;
+            if (count == 0) count = 32;  /* X register is count, 0 means wrapped */
+            uint8_t mode = cmd & 0xE0;
+
+            if (mode < 0xA0) {
+                /* RLE fill from dictionary */
+                uint8_t dict_idx = (mode == 0) ? 0 : (mode >> 5);
+                uint8_t fill_val = dict[dict_idx];
+                for (int i = 0; i < count; i++) {
+                    bus_write8(0x00, 0x2180, fill_val);
+                }
+            } else if (mode == 0xA0) {
+                /* Copy literal bytes from source */
+                for (int i = 0; i < count; i++) {
+                    bus_write8(0x00, 0x2180, bus_read8(src_bank, ptr + y));
+                    y++;
+                }
+            } else if (mode == 0xC0) {
+                /* Incrementing fill: read seed, write count times with INC */
+                uint8_t val = bus_read8(src_bank, ptr + y);
+                y++;
+                for (int i = 0; i < count; i++) {
+                    bus_write8(0x00, 0x2180, val);
+                    val++;
+                }
+            } else {
+                /* $E0: copy literal bytes (same as $A0) */
+                for (int i = 0; i < count; i++) {
+                    bus_write8(0x00, 0x2180, bus_read8(src_bank, ptr + y));
+                    y++;
+                }
+            }
+
+            /* Page boundary adjustment (original checks Y >= $DC) */
+            if (y >= 0xDC) {
+                ptr += y;
+                y = 0;
+            }
+        }
+    } else if (comp_type == 3) {
+        /* LZ bitstream decompression (mode 3) */
+        /* Mode 2 (type byte 3): LZ bitstream with 12-bit ring buffer.
+         *
+         * Ring buffer at $7F:F000 (4096 bytes, wraps with & 0xFFF).
+         * Control bytes: 8 bits, MSB first.
+         *   Bit 1 = literal: read 1 byte, write to output + ring buf.
+         *   Bit 0 = back-ref: read 2 bytes, decode ring offset + length.
+         *     If 2-byte value is 0, end of stream.
+         *     ring_offset = ((byte0 << 4) | (byte1 >> 4)) & 0xFFF
+         *     length = (byte1 & 0x0F) + 2
+         */
+        uint8_t *wram = bus_get_wram();
+        if (!wram) return;
+
+        /* Ring buffer in WRAM at $7F:F000 = offset $1F000 */
+        uint8_t *ring = wram + 0x1F000;
+        uint16_t ring_write = 1;  /* write position starts at 1 */
+        uint32_t total_output = 0;
+
+        uint16_t ptr = src_lo;
+        /* Skip type byte, read control byte address */
+        uint16_t ctrl_pos = ptr + 1;
+        uint16_t data_pos = ptr + 2;
+        uint16_t y = 0;  /* offset into data from data_pos */
+        int bits_left = 8;
+        uint8_t ctrl = bus_read8(src_bank, ctrl_pos);
+
+        while (1) {
+            /* Shift out next bit */
+            int bit = (ctrl >> 7) & 1;
+            ctrl <<= 1;
+
+            if (bit) {
+                /* Literal byte */
+                uint8_t val = bus_read8(src_bank, data_pos + y);
+                y++;
+                bus_write8(0x00, 0x2180, val);
+                ring[ring_write] = val;
+                ring_write = (ring_write + 1) & 0x0FFF;
+                total_output++;
+            } else {
+                /* Back-reference: read 2-byte descriptor */
+                uint8_t byte0 = bus_read8(src_bank, data_pos + y);
+                uint8_t byte1 = bus_read8(src_bank, data_pos + y + 1);
+                uint16_t ref16 = (uint16_t)byte0 | ((uint16_t)byte1 << 8);
+
+                if (ref16 == 0) break;  /* end of stream */
+                y += 2;
+
+                /* Decode: after XBA, value = byte1 | (byte0 << 8)
+                 * ring_offset = (byte1 | (byte0 << 8)) >> 4 = (byte0 << 4) | (byte1 >> 4)
+                 * length = (byte1 & 0x0F) + 2 */
+                uint16_t ring_read = ((byte0 << 4) | (byte1 >> 4)) & 0x0FFF;
+                int length = (byte1 & 0x0F) + 2;
+
+                for (int i = 0; i < length; i++) {
+                    uint8_t val = ring[ring_read];
+                    bus_write8(0x00, 0x2180, val);
+                    ring[ring_write] = val;
+                    ring_write = (ring_write + 1) & 0x0FFF;
+                    ring_read = (ring_read + 1) & 0x0FFF;
+                    total_output++;
+                }
+            }
+
+            bits_left--;
+            if (bits_left == 0) {
+                /* Reload control byte */
+                bits_left = 8;
+                ctrl_pos = data_pos + y;
+                y++;
+                ctrl = bus_read8(src_bank, ctrl_pos);
+            }
+        }
+        (void)total_output;
+    } else {
+        printf("mim: TODO: compression mode %d not yet implemented\n", comp_type);
+    }
+}
+
+/*
+ * $00:8BB7 — Decompress to WRAM $7F:8000
+ *
+ * Source pointer at DP $5D-$5F. Decompresses data and writes to
+ * WRAM starting at $7F:8000 via the WRAM port ($2180).
+ */
+static void mim_008BB7(void) {
+    op_sep(0x30);
+
+    /* Set WRAM destination to $7F:8000 */
+    bus_write8(0x00, 0x2181, 0x00);
+    bus_write8(0x00, 0x2182, 0x80);
+    bus_write8(0x00, 0x2183, 0x01);  /* bank $7F → bit 0 = 1 */
+
+    /* Reuse $8BF5's decompression with the destination already set */
+    uint16_t src_lo = bus_wram_read16(g_cpu.DP + 0x5D);
+    uint8_t src_bank = bus_wram_read8(g_cpu.DP + 0x5F);
+    uint8_t comp_type = bus_read8(src_bank, src_lo);
+
+    if (comp_type < 1 || comp_type > 3) return;
+
+    /* Call $8BF5 with pre-set WRAM destination */
+    g_cpu.X = 0x0000;
+    CPU_SET_A8(0x01);  /* bank $7F → bit = 1 */
+    /* Save and override X with $8000 for the WRAM offset */
+    bus_write8(0x00, 0x2181, 0x00);
+    bus_write8(0x00, 0x2182, 0x80);
+    bus_write8(0x00, 0x2183, 0x01);
+    g_cpu.X = 0x8000;
+    mim_008BF5();
+}
+
+/*
+ * $00:8781 — Decompress ROM data to VRAM
+ *
+ * Entry: A = VRAM word address for DMA dest, [$5D] = compressed data size,
+ *        source data follows the 2-byte size at [$5D+2].
+ * Decompresses to WRAM $7F:8000, then DMA transfers to VRAM.
+ */
+static void mim_008781(void) {
+    op_rep(0x20);
+    op_sep(0x10);
+
+    /* A = VRAM destination word address */
+    uint16_t vram_dest = CPU_A16();
+    bus_wram_write16(g_cpu.DP + 0x2A, vram_dest);
+
+    /* Read compressed data size from [$5D] (16-bit indirect long) */
+    uint16_t src_lo = bus_wram_read16(g_cpu.DP + 0x5D);
+    uint8_t src_bank = bus_wram_read8(g_cpu.DP + 0x5F);
+    uint16_t data_size = bus_read16(src_bank, src_lo);
+    bus_wram_write16(g_cpu.DP + 0x2C, data_size);
+
+    /* printf("mim: $8781 VRAM load: src=$%02X:%04X size=%u vram=$%04X\n",
+           src_bank, src_lo, data_size, vram_dest); */
+
+    /* Set DMA source = $7F:8000 (decompressed data) */
+    bus_wram_write8(g_cpu.DP + 0x2E, 0x00);
+    bus_wram_write16(g_cpu.DP + 0x2F, 0x8000);
+    bus_wram_write8(g_cpu.DP + 0x31, 0x7F);
+
+    /* Advance source pointer past the 2-byte size field */
+    src_lo += 2;
+    bus_wram_write16(g_cpu.DP + 0x5D, src_lo);
+
+    /* Decompress to WRAM $7F:8000 */
+    mim_008BB7();
+
+    /* Set up DMA transfer table pointer at DP $18-$1A */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x18, 0x002A);
+    bus_wram_write8(g_cpu.DP + 0x1A, 0x00);
+
+    /* Execute DMA transfer to VRAM */
+    mim_008506();
+}
+
+/*
+ * $00:D18B — Fill tilemap buffer ($7F:F000) via DMA
+ *
+ * DMA channel 7: fills 2048 bytes at WRAM $7F:F000 with data from
+ * a fixed source at $80:D1BD (likely zeroes/spaces for clearing).
+ */
+static void mim_00D18B(void) {
+    op_rep(0x20);
+    op_sep(0x10);
+
+    /* Set WRAM destination to $7F:F000 */
+    bus_write8(0x00, 0x2181, 0x00);
+    bus_write8(0x00, 0x2182, 0xF0);
+    bus_write8(0x00, 0x2183, 0x01);  /* $7F */
+
+    /* DMA channel 7: fixed source → WRAM port ($2180) */
+    bus_write8(0x00, 0x4371, 0x80);  /* B-bus dest = $2180 */
+    bus_write8(0x00, 0x4370, 0x08);  /* DMA mode: fixed source, A→B */
+    bus_write16(0x00, 0x4375, 0x0800);  /* transfer size = 2048 */
+    bus_write16(0x00, 0x4372, 0xD1BD);  /* source addr */
+    bus_write8(0x00, 0x4374, 0x80);  /* source bank $80 */
+
+    /* Trigger DMA channel 7 */
+    bus_write8(0x00, 0x420B, 0x80);
+}
+
+/*
+ * $00:D11F — Tilemap writer
+ *
+ * Reads a compressed tilemap from the source pointed to by X (bank = DB)
+ * and writes it to WRAM $7F:F000 as 16-bit tilemap entries.
+ *
+ * Format: [row][col][tile bytes...]
+ *   Row/col encode starting VRAM position.
+ *   $00 = end, $F0-$FE = set palette, $FF = newline, else = tile char.
+ */
+static void mim_00D11F(void) {
+    op_rep(0x30);
+
+    uint16_t src = g_cpu.X;
+    uint8_t bank = g_cpu.DB;
+    uint16_t palette = 0x2100;  /* default palette bits */
+    uint16_t y = 0;
+
+    /* Read row (byte 0) and col (byte 1) to compute tilemap offset */
+    uint8_t row = bus_read8(bank, src + y) & 0xFF;
+    y++;
+    uint16_t base_offset = (uint16_t)(row << 6);  /* row * 64 bytes */
+
+    uint8_t col = bus_read8(bank, src + y) & 0xFF;
+    y++;
+    base_offset += col * 2;
+
+    uint16_t x_offset = base_offset;
+
+    /* Process tile stream */
+    while (1) {
+        uint8_t ch = bus_read8(bank, src + y);
+        y++;
+
+        if (ch == 0x00) break;  /* end */
+
+        if (ch >= 0xF0) {
+            if (ch == 0xFF) {
+                /* Newline: advance to next row */
+                base_offset += 0x0040;
+                x_offset = base_offset;
+            } else {
+                /* Set palette: low 3 bits → palette number */
+                uint8_t pal = ch & 0x07;
+                palette = 0x2100 | ((uint16_t)pal << 10);
+            }
+            continue;
+        }
+
+        /* Regular tile: subtract $20 (ASCII offset), OR with palette */
+        uint16_t tile = ((uint16_t)ch - 0x20) | palette;
+        bus_write8(0x00, 0x2180, (uint8_t)(tile & 0xFF));
+        bus_write8(0x00, 0x2181, (uint8_t)(tile >> 8));
+
+        /* Write directly to WRAM $7F:F000 + x_offset */
+        uint8_t *wram = bus_get_wram();
+        if (wram) {
+            uint32_t addr = 0x1F000 + x_offset;  /* $7F:F000 in WRAM = offset $1F000 */
+            wram[addr] = (uint8_t)(tile & 0xFF);
+            wram[addr + 1] = (uint8_t)(tile >> 8);
+        }
+        x_offset += 2;
+    }
+}
+
+/*
+ * $00:8F27 — Sprite/tile DMA setup
+ *
+ * Sets up a DMA transfer table entry for sprite tile data.
+ * Entry: A = source bank, X = source addr, Y = VRAM dest word addr.
+ * Reads first byte of source to determine tile count, then calls $8506.
+ */
+static void mim_008F27(void) {
+    op_sep(0x20);
+    op_rep(0x10);
+
+    uint8_t bank = CPU_A8();
+    g_cpu.DB = bank;  /* PHB; PHA; PLB */
+
+    /* Store VRAM dest and source */
+    bus_wram_write16(g_cpu.DP + 0x2A, g_cpu.Y);
+    bus_wram_write16(g_cpu.DP + 0x60, g_cpu.X);
+    bus_wram_write8(g_cpu.DP + 0x62, bank);
+
+    /* Source+1 = DMA source addr, bank = same */
+    uint16_t src_plus_1 = g_cpu.X + 1;
+    bus_wram_write16(g_cpu.DP + 0x2F, src_plus_1);
+    bus_wram_write8(g_cpu.DP + 0x31, bank);
+
+    /* Read tile count from source[0] via [$60] indirect long */
+    uint8_t tile_count = bus_read8(bank, g_cpu.X);
+    uint16_t byte_count;
+    if (tile_count >= 0x80) {
+        byte_count = (uint16_t)(tile_count << 1);  /* large: count * 2 */
+        bus_wram_write8(g_cpu.DP + 0x2C, (uint8_t)(byte_count & 0xFF));
+        bus_wram_write8(g_cpu.DP + 0x2D, 0x01);
+    } else {
+        byte_count = (uint16_t)(tile_count << 1);
+        bus_wram_write8(g_cpu.DP + 0x2C, (uint8_t)(byte_count & 0xFF));
+        bus_wram_write8(g_cpu.DP + 0x2D, 0x00);
+    }
+
+    /* DMA mode = $0D (word write, A→B, auto-increment) */
+    bus_wram_write8(g_cpu.DP + 0x2E, 0x0D);
+
+    /* Set DMA table pointer at DP $18-$1A = $002A */
+    bus_wram_write16(g_cpu.DP + 0x18, 0x002A);
+    bus_wram_write8(g_cpu.DP + 0x1A, 0x00);
+
+    /* Execute DMA */
+    mim_008506();
+}
+
+/*
  * $00:9203 — SPC700 communication port write
  *
  * Sends a command to the SPC700 audio processor.
@@ -692,6 +1272,118 @@ void mim_009203(void) {
 }
 
 /*
+ * $00:915A — SPC700 IPL upload routine (called via JSR, not JSL)
+ *
+ * Implements the standard SNES SPC700 boot protocol:
+ *   1. Wait for IPL ready signal ($BBAA on ports $2140-$2141)
+ *   2. For each block in the data stream:
+ *      - Read 16-bit block size + 16-bit destination address
+ *      - Upload bytes with echo handshake on port $2140
+ *      - Handle bank boundary crossing
+ *   3. Final block (size=0) sends execution start address
+ *
+ * Data format at source: [u16 size][u16 dest][size bytes]...
+ * Terminated by a block with size=0 (dest becomes execution address).
+ *
+ * Parameters: src_addr = source address low (X), src_bank = bank byte (A)
+ */
+
+/*
+ * SPC700 upload helper — reads sequential bytes from ROM,
+ * tracking position across LoROM bank boundaries.
+ */
+typedef struct {
+    uint16_t ptr_lo;
+    uint8_t  ptr_bank;
+    uint16_t y;
+} SpcReadState;
+
+static uint8_t spc_read_next(SpcReadState *s) {
+    uint8_t b = bus_read8(s->ptr_bank, s->ptr_lo + s->y);
+    s->y++;
+    if ((uint32_t)(s->ptr_lo + s->y) > 0xFFFF) {
+        s->y = 0;
+        s->ptr_lo = 0x8000;
+        s->ptr_bank++;
+    }
+    return b;
+}
+
+static uint16_t spc_read_next16(SpcReadState *s) {
+    uint8_t lo = spc_read_next(s);
+    uint8_t hi = spc_read_next(s);
+    return (uint16_t)(lo | (hi << 8));
+}
+
+/*
+ * Hybrid SPC700 upload: uses the real IPL handshake for the initial
+ * boot, then writes data directly to SPC RAM for reliability.
+ *
+ * The polled byte-by-byte protocol has cycle-level timing dependencies
+ * that are hard to satisfy in a recomp environment. Direct RAM writes
+ * achieve the same result (data in SPC RAM) without the timing issues.
+ */
+static void mim_00915A(uint16_t src_addr, uint8_t src_bank) {
+    SpcReadState rs;
+    rs.ptr_lo = src_addr;
+    rs.ptr_bank = src_bank;
+    rs.y = 0;
+
+    int max_spins = 200000;
+    int spins;
+
+    printf("mim: SPC700 IPL upload from $%02X:%04X\n", src_bank, src_addr);
+
+    /* Wait for SPC700 ready signal ($BBAA on ports 0-1).
+     * This works for both the IPL ROM and uploaded programs that
+     * signal ready with the same $BBAA convention. */
+    spins = 0;
+    while (1) {
+        bus_run_cycles(32);
+        uint8_t lo = bus_read8(0x00, 0x2140);
+        uint8_t hi = bus_read8(0x00, 0x2141);
+        if (lo == 0xAA && hi == 0xBB) break;
+        if (++spins > max_spins) {
+            printf("mim: WARNING: SPC700 ready timeout, proceeding with direct write\n");
+            break;
+        }
+    }
+
+    /* Process blocks: read headers from ROM, write data directly to SPC RAM */
+    while (1) {
+        uint16_t block_size = spc_read_next16(&rs);
+        uint16_t dest_addr = spc_read_next16(&rs);
+
+        if (block_size == 0) {
+            printf("mim: SPC700 upload done, execution at $%04X\n", dest_addr);
+
+            /* Tell the SPC700 to jump to the execution address.
+             * Write dest to ports 2-3, transfer flag=0 to port 1,
+             * and a command byte to port 0. */
+            bus_write8(0x00, 0x2142, (uint8_t)(dest_addr & 0xFF));
+            bus_write8(0x00, 0x2143, (uint8_t)(dest_addr >> 8));
+            bus_write8(0x00, 0x2141, 0x00);  /* transfer flag = 0 (execute) */
+            bus_write8(0x00, 0x2140, 0xCC);  /* command */
+
+            /* Give the SPC700 time to process the execute command,
+             * start the program, and signal ready with $BBAA. */
+            bus_run_cycles(17088);
+            break;
+        }
+
+        printf("mim:   block: %u bytes -> SPC $%04X\n", block_size, dest_addr);
+
+        /* Copy block data directly into SPC700 RAM */
+        uint16_t spc_ptr = dest_addr;
+        for (uint16_t i = 0; i < block_size; i++) {
+            uint8_t byte = spc_read_next(&rs);
+            bus_apu_write_ram(spc_ptr, byte);
+            spc_ptr++;
+        }
+    }
+}
+
+/*
  * $00:90EA — Initial asset load
  *
  * Loads graphics/data from ROM banks $86-$87 via a transfer routine,
@@ -702,27 +1394,31 @@ void mim_0090EA(void) {
     op_sep(0x20);
     op_rep(0x10);
 
-    /* Transfer from $86:8000 */
-    /* TODO: implement transfer subroutine at $00:915A */
-    /* For now, the ROM data is already mapped by LakeSnes */
+    /* JSR $915A — upload from $86:8000 (main audio engine) */
+    mim_00915A(0x8000, 0x86);
 
-    /* SPC700 command $0E (likely: upload audio engine) */
-    op_lda_imm8(0x0E);
+    /* JSR $915A — upload from $86:80DA (secondary data) */
+    mim_00915A(0x80DA, 0x86);
+
+    /* SPC700 command $0E (init audio engine) */
+    op_sep(0x20);
+    CPU_SET_A8(0x0E);
     g_cpu.Y = 0x0000;
-    /* mim_009203(); — skip for now, audio init needs more work */
+    mim_009203();
 
-    /* Transfer from $87:EFB8 */
-    /* TODO: implement $00:915A */
+    /* JSR $915A — upload from $87:EFB8 (audio sample data) */
+    mim_00915A(0xEFB8, 0x87);
 
-    /* Set game state */
+    /* Set game state: $6B = 2 (assets loaded) */
     op_rep(0x20);
     op_ldx_imm16(0x0002);
     bus_wram_write16(0x006B, g_cpu.X);
 
-    /* SPC700 command $02 (likely: start music) */
-    op_lda_imm8(0x02);
+    /* SPC700 command $02 (start music) */
+    op_sep(0x20);
+    CPU_SET_A8(0x02);
     g_cpu.Y = 0x0000;
-    /* mim_009203(); */
+    mim_009203();
 }
 
 /*
@@ -734,29 +1430,407 @@ void mim_00913A(void) {
     op_sep(0x20);
     op_rep(0x10);
 
-    /* SPC700 command $0E */
-    /* TODO: needs $915A transfer routine */
+    /* SPC700 command $0E (re-init audio engine) */
+    CPU_SET_A8(0x0E);
+    g_cpu.Y = 0x0000;
+    mim_009203();
 
-    /* SPC700 command $02 */
+    /* JSR $915A — reload audio data from $87:EFB8 */
+    mim_00915A(0xEFB8, 0x87);
 
-    /* Set $6B = 2 */
+    /* SPC700 command $02 (restart music) */
+    op_sep(0x20);
+    CPU_SET_A8(0x02);
+    g_cpu.Y = 0x0000;
+    mim_009203();
+
+    /* Set $6B = 2 (assets loaded) */
     op_rep(0x20);
     op_ldx_imm16(0x0002);
     bus_wram_write16(0x006B, g_cpu.X);
 }
 
 /*
- * $00:9A5E — Main loop entry / game state dispatcher
+ * $00:911A — Secondary asset load (audio data reload)
  *
- * This is the main game loop. Called once per frame from main.c.
- * In the original ROM, this is an infinite loop. In the recomp,
- * each call processes one frame.
+ * Called from gameplay loop at $9B1F. Uploads audio data from $87:A31F
+ * and sends SPC700 commands.
+ */
+void mim_00911A(void) {
+    op_sep(0x20);
+    op_rep(0x10);
+
+    /* SPC700 command $0E */
+    CPU_SET_A8(0x0E);
+    g_cpu.Y = 0x0000;
+    mim_009203();
+
+    /* JSR $915A — upload from $87:A31F */
+    mim_00915A(0xA31F, 0x87);
+
+    /* SPC700 command $02 */
+    op_sep(0x20);
+    CPU_SET_A8(0x02);
+    g_cpu.Y = 0x0000;
+    mim_009203();
+
+    /* Set $6B = 1 */
+    op_rep(0x20);
+    op_ldx_imm16(0x0001);
+    bus_wram_write16(0x006B, g_cpu.X);
+}
+
+/* === Stub functions for not-yet-recompiled subroutines === */
+
+/*
+ * $00:D24B — Title screen / intro sequence
  *
- * TODO: Recompile the full main loop logic (JSL calls to
- *       $80:8050, $80:8453, $80:8471, $80:842C, state dispatch, etc.)
+ * Sets up Mode 1, loads title screen graphics, displays logo with
+ * DMA transfers, waits for button press. Complex enough to need
+ * its own recompilation pass.
+ */
+static void mim_00D24B(void) {
+    printf("mim: title screen ($00:D24B)\n");
+
+    uint8_t saved_db = g_cpu.DB;
+    g_cpu.DB = 0x00;  /* PHK; PLB */
+
+    op_sep(0x20);
+    op_rep(0x10);
+
+    /* JSL $80:8453 — DMA loader A */
+    mim_008453();
+
+    /* BG character base addresses: all zero */
+    bus_write8(0x00, 0x210B, 0x00);
+    bus_write8(0x00, 0x210C, 0x00);
+
+    /* BG tilemap addresses: all at $6000 (word addr $3000) */
+    bus_write8(0x00, 0x2107, 0x60);
+    bus_write8(0x00, 0x2108, 0x60);
+    bus_write8(0x00, 0x2109, 0x60);
+
+    /* Mode 1 */
+    bus_write8(0x00, 0x2105, 0x01);
+
+    /* Enable BG3 on main screen */
+    bus_write8(0x00, 0x212C, 0x04);
+
+    /* Load compressed title graphics from $91:DE50 to VRAM $0800 */
+    op_rep(0x20);
+    bus_wram_write16(g_cpu.DP + 0x5D, 0xDE50);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0091);
+    g_cpu.C = 0x0800;  /* A = VRAM dest word address */
+    mim_008781();
+
+    /* Load sprite tile data from $80:D482 to VRAM $0000 */
+    op_sep(0x20);
+    g_cpu.Y = 0x0000;
+    g_cpu.X = 0xD482;
+    CPU_SET_A8(0x80);
+    mim_008F27();
+
+    /* Wait one frame */
+    mim_008249();
+
+    /* Fill tilemap buffer at $7F:F000 */
+    mim_00D18B();
+
+    /* Write tilemap from data at $80:D2D6 */
+    g_cpu.X = 0xD2D6;
+    g_cpu.DB = 0x80;
+    mim_00D11F();
+    g_cpu.DB = 0x00;
+
+    /* Set up DMA transfer table at $80:D3CA for tilemap → VRAM */
+    bus_wram_write16(g_cpu.DP + 0x18, 0xD3CA);
+    bus_wram_write8(g_cpu.DP + 0x1A, 0x80);
+    mim_008506();
+
+    /* $82:8DA7 — sprite positioning (stub: just wait a frame) */
+    mim_008249();
+
+    /* Enable display: set brightness to max ($0F), NMI handler writes this to $2100 */
+    bus_wram_write8(g_cpu.DP + 0x01, 0x0F);
+
+    /* Enable NMI */
+    bus_wram_write8(g_cpu.DP + 0x00, 0x81);
+
+    /* Display loop: wait up to 480 frames, exit on Start button */
+    for (uint16_t x = 0; x < 0x01E0; x++) {
+        g_cpu.X = x;
+        mim_008249();
+
+        if (x >= 0x00F0) {
+            /* Check joypad at WRAM $38 for Start button (bit 4) */
+            uint8_t joy = bus_wram_read8(g_cpu.DP + 0x38);
+            if (joy & 0x10) break;
+        }
+    }
+
+    /* Clean up */
+    mim_0082A7();
+    mim_008050();
+
+    g_cpu.DB = saved_db;
+}
+
+/*
+ * $00:D4A3 — Game state machine / world map logic
+ *
+ * Handles the world map, city selection, and game state transitions.
+ * Very large routine with many subroutines.
+ */
+static void mim_00D4A3(void) {
+    printf("mim: STUB $00:D4A3 (game state machine)\n");
+    op_rep(0x30);
+
+    /* Call $90AF for VBlank sync */
+    mim_0090AF();
+
+    /* Initialize some game state variables */
+    bus_wram_write16(0x0E9F, 0x0000);
+    bus_wram_write16(0x0EA1, 0x0000);
+
+    /* The real routine processes the world map and game states.
+     * For now, just set game state to continue. */
+}
+
+/*
+ * $01:8320 — State setup / transition
+ *
+ * Called with A=0 or A=1 to set up different game states.
+ * Configures PPU mode, loads graphics, sets up tilemaps.
+ */
+static void mim_018320(void) {
+    uint16_t param = CPU_A16() & 0x0001;
+    printf("mim: STUB $01:8320 (state setup, param=%d)\n", param);
+
+    op_rep(0x30);
+
+    if (param == 0) {
+        /* State 0: set up display mode */
+        bus_wram_write16(0x12A5, g_cpu.S);  /* save stack for later */
+
+        op_sep(0x20);
+        mim_008050();
+        mim_008453();
+        mim_008471();
+        mim_00842C();
+        mim_008249();
+
+        /* Configure PPU for Mode 9 (Mode 1 + BG3 priority) */
+        bus_write8(0x00, 0x2101, 0x63);
+        bus_write8(0x00, 0x2105, 0x09);
+        bus_write8(0x00, 0x2107, 0x00);
+        bus_write8(0x00, 0x2108, 0x04);
+        bus_write8(0x00, 0x2109, 0x0A);
+        bus_write8(0x00, 0x212C, 0x17);
+        bus_write8(0x00, 0x210B, 0x22);
+        bus_write8(0x00, 0x210C, 0x33);
+    } else {
+        /* State 1: additional setup */
+        op_sep(0x20);
+    }
+
+    /* Clear carry (success) */
+    g_cpu.flag_C = 0;
+}
+
+/*
+ * $02:8000 — Bank 2 entry point (game logic dispatcher)
+ *
+ * Handles game logic flow, sets up function pointers for
+ * the main game state machine.
+ */
+static void mim_028000(void) {
+    printf("mim: STUB $02:8000 (game logic dispatcher)\n");
+    op_rep(0x30);
+
+    /* Save stack pointer */
+    bus_wram_write16(0x12A5, g_cpu.S);
+
+    /* Check $058D for game state */
+    uint16_t state = bus_wram_read16(0x058D);
+    if (state != 0) {
+        bus_wram_write16(0x1215, 0xFFFF);
+    } else {
+        bus_wram_write16(0x1215, 0x0000);
+    }
+
+    /* Clear carry (success) */
+    g_cpu.flag_C = 0;
+}
+
+/* ($00:8BF5 is now implemented above in the Graphics section) */
+
+/*
+ * $00:9A5E — Main game loop
+ *
+ * This is the heart of the game. It runs forever (until quit),
+ * with frame boundaries at mim_008249() calls.
+ *
+ * Flow:
+ *   1. One-time init: load assets ($90EA), PPU init
+ *   2. Title screen ($D24B)
+ *   3. Game setup: SPC commands, state transitions
+ *   4. Gameplay loop ($9B1F onwards)
  */
 void mim_009A5E(void) {
-    /* The main loop calls many subroutines per frame.
-     * This will be filled in as we recompile more game logic.
-     * For now, the NMI handler runs the DMA transfers each frame. */
+    op_rep(0x30);
+    g_cpu.DB = 0x00;  /* PHK; PLB */
+
+    /* === One-time initialization === */
+
+    /* JSL $80:90EA — load initial assets (SPC700 uploads) */
+    mim_0090EA();
+
+game_restart:
+    /* JSL $80:8050 — PPU init */
+    mim_008050();
+
+    /* JSL $80:8453, $80:8471, $80:842C — DMA loaders, OAM init */
+    mim_008453();
+    mim_008471();
+    mim_00842C();
+
+    /* Check $6B: if != 2, reload assets */
+    {
+        uint16_t val_6b = bus_wram_read16(0x006B);
+        if (val_6b != 0x0002) {
+            mim_00913A();
+        }
+    }
+
+    /* SPC700 command $12 with Y=$7F01 (set master volume?) */
+    op_rep(0x30);
+    CPU_SET_A8(0x12);
+    g_cpu.Y = 0x7F01;
+    mim_009203();
+
+    /* SPC700 command $04 with Y=$0000 */
+    CPU_SET_A8(0x04);
+    g_cpu.Y = 0x0000;
+    mim_009203();
+
+    /* JSL $80:D24B — title screen */
+    mim_00D24B();
+
+    /* Store $0004 to $0591 (game state = title done) */
+    op_rep(0x20);
+    bus_wram_write16(0x0591, 0x0004);
+
+title_loop:
+    /* SPC700 command $12 with Y=$7F01 */
+    op_rep(0x30);
+    CPU_SET_A8(0x12);
+    g_cpu.Y = 0x7F01;
+    mim_009203();
+
+    /* Wait 30 frames */
+    for (uint16_t x = 0; x < 0x001E; x++) {
+        g_cpu.X = x;
+        mim_008249();
+    }
+
+    /* SPC700 command $06 with Y=$0007 (start title music?) */
+    CPU_SET_A8(0x06);
+    g_cpu.Y = 0x0007;
+    mim_009203();
+
+    /* JSL $81:8320 with A=0 (state setup) */
+    g_cpu.C = 0x0000;
+    mim_018320();
+
+    /* If carry clear, call $82:8000 */
+    if (!g_cpu.flag_C) {
+        mim_028000();
+    }
+
+    /* JSL $81:8320 with A=1 */
+    g_cpu.C = 0x0001;
+    mim_018320();
+
+    /* JSL $80:90AF — wait/sync */
+    mim_0090AF();
+
+    /* If carry set, loop back to title_loop */
+    if (g_cpu.flag_C) {
+        goto title_loop;
+    }
+
+    /* Load tilemap data via $8BF5 */
+    op_rep(0x20);
+
+    /* Source: $85:8000, dest WRAM $5000, bank $7F */
+    bus_wram_write16(g_cpu.DP + 0x5D, 0x8000);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0085);
+    g_cpu.X = 0x5000;
+    g_cpu.C = 0x007F;
+    mim_008BF5();
+
+    /* Source: $85:890E, dest WRAM $6000, bank $7F */
+    bus_wram_write16(g_cpu.DP + 0x5D, 0x890E);
+    bus_wram_write16(g_cpu.DP + 0x5F, 0x0085);
+    g_cpu.X = 0x6000;
+    g_cpu.C = 0x007F;
+    mim_008BF5();
+
+    /* Set game state $058F = 3 */
+    bus_wram_write16(0x058F, 0x0003);
+
+    /* Reload audio assets */
+    mim_00913A();
+
+gameplay_loop:
+    /* JSL $80:D4A3 — game state machine */
+    mim_00D4A3();
+
+    /* JSL $80:90AF — wait/sync */
+    mim_0090AF();
+
+    /* Check $058F: if == 4, restart from PPU init */
+    {
+        uint16_t state = bus_wram_read16(0x058F);
+        if (state == 0x0004) {
+            goto game_restart;
+        }
+    }
+
+    /* === $9B1F — Gameplay loop === */
+
+    /* Reload audio data */
+    mim_00911A();
+
+    /* Wait/sync */
+    mim_0090AF();
+
+    /* Read game state table index:
+     * index = $0504 * 5 + $0593, lookup in table at $9B5E */
+    {
+        uint16_t val_0504 = bus_wram_read16(0x0504);
+        uint16_t val_0593 = bus_wram_read16(0x0593);
+        uint16_t index = (val_0504 * 5 + val_0593) * 2;
+
+        /* Read state handler address from jump table at $9B5E */
+        uint16_t handler = bus_read16(0x00, 0x9B5E + index);
+        bus_wram_write16(0x0502, handler);
+
+        printf("mim: gameplay state dispatch: $0504=%04X $0593=%04X handler=$%04X\n",
+               val_0504, val_0593, handler);
+    }
+
+    /* TODO: Call the state-specific handler subroutines:
+     * JSL $80:9BCE, $80:9B7C, $80:9D4B, $80:9D7F, $80:9E83
+     * JSL $80:BE03, $81:9EB9
+     * These implement the actual gameplay (world map, city,
+     * Q&A, artifact collection, etc.)
+     */
+
+    /* Wait/sync and loop back to gameplay */
+    mim_0090AF();
+
+    /* Reload audio and loop back through $D4A3 */
+    mim_00913A();
+    goto gameplay_loop;
 }

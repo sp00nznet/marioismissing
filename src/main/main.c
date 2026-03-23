@@ -10,6 +10,7 @@
 #include "mim/cpu_ops.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <setjmp.h>
 
 static const char *find_rom_path(int argc, char *argv[]) {
     if (argc >= 2) return argv[1];
@@ -47,17 +48,19 @@ int main(int argc, char *argv[]) {
 
     printf("Running... (press Escape to quit)\n\n");
 
-    /* === Main frame loop === */
-    while (snesrecomp_begin_frame()) {
-        /* Run NMI handler */
-        mim_nmi();
-
-        /* Run one main loop iteration */
+    /*
+     * The game's main loop ($9A5E) is an infinite loop that calls
+     * mim_008249() whenever it needs a frame boundary. That function
+     * renders the frame, polls input, and runs the NMI handler.
+     *
+     * We use setjmp/longjmp so mim_008249() can cleanly exit the
+     * deep call stack when the user quits.
+     */
+    if (setjmp(mim_quit_jmp) == 0) {
+        /* Normal path: enter the game's infinite main loop */
         mim_main_loop();
-
-        /* Render PPU and present */
-        snesrecomp_end_frame();
     }
+    /* longjmp lands here on quit */
 
     printf("Shutting down...\n");
     snesrecomp_shutdown();

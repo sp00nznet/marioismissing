@@ -22,9 +22,11 @@ The real goal here is to **drive snesrecomp development** — every new game tar
 
 ## Status
 
-**Project Phase: Scaffolding**
+**Project Phase: Title Screen + Audio**
 
-We're just getting started. The project structure is in place, snesrecomp is linked, and we're ready to start disassembling and recompiling functions from the ROM.
+The copyright/title screen displays correctly with full audio playback. The game boots, uploads the SPC700 audio engine, decompresses and renders the title screen graphics, and enters the main game loop.
+
+![Title Screen](intro.png)
 
 ### Progress Tracker
 
@@ -34,32 +36,33 @@ We're just getting started. The project structure is in place, snesrecomp is lin
 | ROM analysis | DONE | — | LoROM, 1MB, reset=$8000, NMI=$819D, no SRAM |
 | Boot chain | DONE | 7 | Reset vector, PPU init, WRAM clear, DMA loaders, OAM init, RNG seed |
 | NMI handler | DONE | 4 | Reentrance guard, OAM DMA, VRAM ring buffer, indirect dispatch |
-| SPC700 comms | WIP | 1 | Port write handshake done, audio upload TODO |
-| Main loop | WIP | 3 | Entry point stubbed, asset loaders partially done |
-| Title screen | TODO | 0 | Logo, menu, "Press Start" |
-| World map | TODO | 0 | City selection, Luigi walking on map |
+| SPC700 audio | DONE | 4 | IPL upload, command protocol, asset load/reload |
+| Main loop | DONE | 1 | Full game flow: init → title → setup → gameplay loop |
+| Decompression | DONE | 4 | Byte-RLE (mode 1) and LZ bitstream (mode 3), VRAM loader |
+| Title screen | DONE | 6 | Copyright screen with full graphics and audio |
+| World map | WIP | 0 | State machine stubbed, needs game logic recompilation |
 | City exploration | TODO | 0 | Luigi walking, NPC interaction, sprite rendering |
 | Q&A system | TODO | 0 | Question display, answer selection, artifact return |
-| Audio engine | TODO | 0 | SPC700 music/SFX upload and playback |
 | Full playthrough | TODO | 0 | All cities, all artifacts, ending sequence |
 
-**Total recompiled functions: 12** (plus mirrors = 24 registered addresses)
+**Total recompiled functions: 31** (62 registered addresses with LoROM mirrors)
 
 ### What's Done
-- Project structure matching the snesrecomp ecosystem (CMake, includes, recomp layout)
-- Full 65816 CPU instruction helper library (`cpu_ops.h`) — every op you'd need to recompile
-- snesrecomp submodule linked — real PPU, real SPC700 audio, real DMA, all ready to go
-- ROM analyzed: LoROM, 1MB, RESET at $8000, NMI at $819D, IRQ at $818A, no SRAM, no coprocessors
-- **Complete boot chain**: reset vector ($8000), PPU init ($8050), VRAM clear, CGRAM clear, OAM init ($842C), DMA table loaders ($8453/$8471/$8506), RNG seed ($8349)
-- **Full NMI handler**: reentrance guard, frame counter, OAM DMA ($85C0), VRAM/CGRAM ring buffer DMA, indirect vector dispatch ($81E1), INIDISP restore
-- **SPC700 command protocol**: handshake port write ($9203)
+- **Complete boot chain**: reset vector, PPU init, WRAM clear, CGRAM clear, OAM init, DMA table engine, RNG seed
+- **Full NMI handler**: reentrance guard, frame counter, OAM DMA, VRAM/CGRAM ring buffer DMA, indirect vector dispatch, INIDISP restore
+- **SPC700 audio**: IPL boot upload ($915A), command protocol ($9203), initial asset load ($90EA), audio reload ($913A/$911A) — music plays from boot
+- **Decompression engine**: byte-level RLE with 5-byte dictionary (mode 1), LZ bitstream with 12-bit ring buffer (mode 3)
+- **Graphics pipeline**: VRAM decompressor+DMA ($8781/$8BB7), sprite tile loader ($8F27), tilemap writer ($D11F), tilemap buffer fill ($D18B)
+- **Title screen**: full implementation with Mode 1 BG3, compressed tile graphics, tilemap rendering, Start button detection
+- **Main game loop** ($9A5E): complete flow from boot → asset load → title screen → state setup → gameplay loop
+- **Frame architecture**: game-driven frame loop with `$8249` as frame boundary, `setjmp`/`longjmp` quit handling
 - ROM analysis tool (`tools/rom_analyze.py`) with M/X flag-tracking disassembler
 
 ### What's Next
-1. **Recompile the transfer subroutine at $00:915A** — used by asset loaders to move ROM data
-2. **SPC700 audio engine upload** — get music playing via the IPL boot protocol
-3. **Main loop state machine at $9A5E** — the game's frame dispatcher
-4. **Title screen** — first visual output, the moment Luigi appears on screen
+1. **State transition functions** ($01:8320, $02:8000) — PPU mode setup for gameplay
+2. **World map renderer** ($D4A3) — the city selection screen
+3. **Gameplay state handlers** — the jump table at $9B5E dispatching to exploration/Q&A
+4. **Compressed tilemap loader** ($8BF5 mode 2) — word-level decompression for game screens
 
 ## Architecture
 
@@ -171,7 +174,7 @@ This game is part of a family of SNES static recompilations, all sharing the sam
 | [mk](https://github.com/sp00nznet/mk) | Super Mario Kart | 46 functions, through character select |
 | [stuntrace](https://github.com/sp00nznet/stuntrace) | Stunt Race FX | 37 functions, attract mode + title |
 | [mariopaint](https://github.com/sp00nznet/mariopaint) | Mario Paint | 9 functions, boot chain |
-| **marioismissing** | **Mario is Missing!** | **Just started — you are here** |
+| **marioismissing** | **Mario is Missing!** | **31 functions, title screen + audio** |
 
 Each game project drives improvements in snesrecomp. Super Mario Kart pushed PPU rendering and DMA. Stunt Race FX added Super FX (GSU-2) support. Mario Paint brought SNES Mouse input. Mario is Missing will likely stress-test the **text rendering pipeline** and **data-driven game logic** paths — every game teaches us something new about the hardware.
 

@@ -6,6 +6,8 @@
 #ifndef MIM_FUNCTIONS_H
 #define MIM_FUNCTIONS_H
 
+#include <setjmp.h>
+
 /* Register all recompiled functions in the function table */
 void mim_register_all(void);
 
@@ -27,10 +29,22 @@ void mim_0081E5(void);     /* Wait for VBlank end */
 /* === SPC700 / Audio === */
 void mim_009203(void);     /* SPC700 command write (A=cmd, Y=data) */
 
+/* === Frame synchronization === */
+void mim_008249(void);     /* Wait for next frame (VBlank sync) */
+void mim_0082A7(void);     /* Screen disable / cleanup */
+void mim_0090AF(void);     /* VBlank wait + SPC700 sync */
+
 /* === Main loop === */
 void mim_009A5E(void);     /* Main loop entry / game state dispatcher */
 void mim_0090EA(void);     /* Initial asset load (ROM banks $86-$87) */
 void mim_00913A(void);     /* Asset reload (audio data) */
+void mim_00911A(void);     /* Secondary asset load (audio data) */
+
+/*
+ * Quit mechanism — setjmp/longjmp for clean exit from deep call stacks.
+ * main.c sets the jump point; mim_008249() longjmps on quit.
+ */
+extern jmp_buf mim_quit_jmp;
 
 /* Aliases for main.c readability */
 #define mim_reset       mim_008000

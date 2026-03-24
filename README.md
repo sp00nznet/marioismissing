@@ -22,11 +22,13 @@ The real goal here is to **drive snesrecomp development** — every new game tar
 
 ## Status
 
-**Project Phase: Title Screen + Audio**
+**Project Phase: Bowser's Castle**
 
-The copyright/title screen displays correctly with full audio playback. The game boots, uploads the SPC700 audio engine, decompresses and renders the title screen graphics, and enters the main game loop.
+The game is playable through the copyright screen, interactive world map menu, and into Bowser's Castle. Full audio playback with SPC700 engine. All three compression formats implemented.
 
 ![Title Screen](intro.png)
+![World Map Menu](yoshi.png)
+![Bowser's Castle](wall2.png)
 
 ### Progress Tracker
 
@@ -38,31 +40,37 @@ The copyright/title screen displays correctly with full audio playback. The game
 | NMI handler | DONE | 4 | Reentrance guard, OAM DMA, VRAM ring buffer, indirect dispatch |
 | SPC700 audio | DONE | 4 | IPL upload, command protocol, asset load/reload |
 | Main loop | DONE | 1 | Full game flow: init → title → setup → gameplay loop |
-| Decompression | DONE | 4 | Byte-RLE (mode 1) and LZ bitstream (mode 3), VRAM loader |
+| Decompression | DONE | 5 | All 3 modes: byte-RLE, word-level, LZ bitstream |
 | Title screen | DONE | 6 | Copyright screen with full graphics and audio |
-| World map | WIP | 0 | State machine stubbed, needs game logic recompilation |
+| World map menu | DONE | 8 | Yoshi + speech bubble, interactive cursor, world map BG |
+| Game state setup | DONE | 6 | $01:8320, $02:8000, PPU mode transitions, fade in/out |
+| Bowser's Castle | WIP | 4 | Castle walls rendering, 13 graphics blocks loaded, palettes correct |
 | City exploration | TODO | 0 | Luigi walking, NPC interaction, sprite rendering |
 | Q&A system | TODO | 0 | Question display, answer selection, artifact return |
 | Full playthrough | TODO | 0 | All cities, all artifacts, ending sequence |
 
-**Total recompiled functions: 31** (62 registered addresses with LoROM mirrors)
+**Total recompiled functions: 36+** (72+ registered addresses with LoROM mirrors)
 
 ### What's Done
 - **Complete boot chain**: reset vector, PPU init, WRAM clear, CGRAM clear, OAM init, DMA table engine, RNG seed
-- **Full NMI handler**: reentrance guard, frame counter, OAM DMA, VRAM/CGRAM ring buffer DMA, indirect vector dispatch, INIDISP restore
+- **Full NMI handler**: reentrance guard, frame counter, OAM DMA, VRAM/CGRAM ring buffer DMA, indirect vector dispatch, INIDISP restore, joypad reading
 - **SPC700 audio**: IPL boot upload ($915A), command protocol ($9203), initial asset load ($90EA), audio reload ($913A/$911A) — music plays from boot
-- **Decompression engine**: byte-level RLE with 5-byte dictionary (mode 1), LZ bitstream with 12-bit ring buffer (mode 3)
-- **Graphics pipeline**: VRAM decompressor+DMA ($8781/$8BB7), sprite tile loader ($8F27), tilemap writer ($D11F), tilemap buffer fill ($D18B)
+- **Decompression engine**: byte-level RLE (mode 1), word-level (mode 2), LZ bitstream with 12-bit ring buffer (mode 3). Optimized with direct ROM/WRAM access for performance.
+- **Packed 4bpp tile converter**: converts packed pixel format to SNES interleaved bitplane format ($881B equivalent)
+- **Graphics pipeline**: VRAM decompressor+DMA ($8781/$87DF/$8BB7), sprite tile loader ($8F27), tilemap writer ($D11F), tilemap buffer fill ($D18B), two CGRAM loaders ($8E9D/$8EE4)
 - **Title screen**: full implementation with Mode 1 BG3, compressed tile graphics, tilemap rendering, Start button detection
-- **Main game loop** ($9A5E): complete flow from boot → asset load → title screen → state setup → gameplay loop
+- **World map menu**: Yoshi sprite with speech bubble, interactive cursor (Up/Down + palette highlight), world map background (BG1+BG2), per-frame attract mode update ($869B)
+- **Game state setup**: $01:8320 with full PPU mode configuration, $02:8000 game logic dispatcher, screen fade in/out ($828C/$82A7), shared graphics loader ($D3D2)
+- **Bowser's Castle**: $D4A3 gameplay state machine with PPU setup ($D8A1), 13 compressed graphics blocks loaded to VRAM, 3 palette sets, castle walls with arched windows rendering correctly
+- **Main game loop** ($9A5E): complete flow from boot → asset load → title screen → menu → state setup → castle
 - **Frame architecture**: game-driven frame loop with `$8249` as frame boundary, `setjmp`/`longjmp` quit handling
 - ROM analysis tool (`tools/rom_analyze.py`) with M/X flag-tracking disassembler
 
 ### What's Next
-1. **State transition functions** ($01:8320, $02:8000) — PPU mode setup for gameplay
-2. **World map renderer** ($D4A3) — the city selection screen
-3. **Gameplay state handlers** — the jump table at $9B5E dispatching to exploration/Q&A
-4. **Compressed tilemap loader** ($8BF5 mode 2) — word-level decompression for game screens
+1. **World-specific tilemap handlers** ($DA06 chain) — BG1 foreground details for the castle
+2. **Luigi sprite rendering** — the player character on screen
+3. **Gameplay sub-routines** ($D62B, $D648, $D6DA, $E0C9) — game state updates per frame
+4. **City exploration** — walking around cities, talking to NPCs
 
 ## Architecture
 
